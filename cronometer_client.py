@@ -548,6 +548,7 @@ class CronometerClient:
         diary_group: Optional[str] = "auto",
         *,
         skip_if_duplicate: bool = True,
+        diary: Optional[list[DiaryEntry]] = None,
     ) -> dict:
         """Log a serving. Returns {"entry_id": int|None, ...}.
 
@@ -555,6 +556,13 @@ class CronometerClient:
         cache, so it still works when every request is a fresh process (as
         on Vercel). Double-logging your lunch because a Shortcut retried is
         an easy and annoying failure.
+
+        `diary` supplies that check with an already-fetched snapshot of the
+        day. Without it, logging four foods from one photo means four
+        identical get_diary round trips before four writes — the read is
+        the same every time, and on a phone those round trips are most of
+        the wait. Callers writing a batch should read the day once and pass
+        it here.
         """
         day = normalize_date(date)
         group = resolve_diary_group(diary_group)
@@ -563,7 +571,7 @@ class CronometerClient:
             raise ValueError("grams must be positive")
 
         if skip_if_duplicate:
-            for e in self.get_diary(day):
+            for e in (self.get_diary(day) if diary is None else diary):
                 if (e.food_id == int(food_id)
                         and e.measure_id == int(measure_id)
                         and abs(e.grams - grams) < 0.5

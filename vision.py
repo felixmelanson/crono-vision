@@ -17,6 +17,7 @@ import base64
 import json
 import logging
 import os
+import time
 from dataclasses import asdict, dataclass, field
 from typing import Optional
 
@@ -178,7 +179,8 @@ def analyze_photo(
     model: Optional[str] = None,
     hint: Optional[str] = None,
     mime_type: Optional[str] = None,
-    timeout: float = 60.0,
+    timeout: float = 20.0,
+    budget: float = 40.0,
     http: Optional[httpx.Client] = None,
 ) -> PhotoAnalysis:
     """Identify foods in a photo.
@@ -192,6 +194,13 @@ def analyze_photo(
     giving up. Any other kind of failure — a bad key, a bad image, a
     genuine bug in the request — fails immediately, since trying the same
     broken request against a different model wouldn't help.
+
+    `timeout` caps one attempt; `budget` caps all of them together. Both
+    matter, and the second one is the whole point: four models at a 60s
+    timeout each is a four-minute worst case inside a function Vercel kills
+    at 60s, so a slow — not failing — Gemini used to end as a 504 with a
+    non-JSON body, after the diary writes had already happened. Falling
+    back is only worth doing while there's time left to serve the answer.
     """
     key = api_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
     if not key:
@@ -205,12 +214,19 @@ def analyze_photo(
     candidates = [primary] + [m for m in _fallback_models() if m != primary]
 
     client = http or httpx.Client(timeout=timeout)
+    deadline = time.monotonic() + budget
     try:
         last_error: Optional[VisionError] = None
         for i, candidate_model in enumerate(candidates):
+            left = deadline - time.monotonic()
+            if left <= 1.0 and last_error is not None:
+                log.warning("out of time after %s, not trying %s",
+                            candidates[i - 1], candidate_model)
+                break
             try:
                 return _call_model(client, candidate_model, raw, key,
-                                   hint=hint, mime_type=mime_type)
+                                   hint=hint, mime_type=mime_type,
+                                   timeout=min(timeout, max(left, 1.0)))
             except VisionOverloaded as e:
                 last_error = e
                 if i + 1 < len(candidates):
@@ -231,6 +247,7 @@ def _call_model(
     *,
     hint: Optional[str],
     mime_type: Optional[str],
+    timeout: Optional[float] = None,
 ) -> PhotoAnalysis:
     """One request against one model. Raises VisionOverloaded for a
     retryable failure, plain VisionError for anything else."""
@@ -272,10 +289,12 @@ def _call_model(
             pass
 
     try:
+        kwargs = {} if timeout is None else {"timeout": timeout}
         r = client.post(
             f"{API_ROOT}/{model}:generateContent",
             json=body,
             headers={"x-goog-api-key": key, "content-type": "application/json"},
+            **kwargs,
         )
     except httpx.HTTPError as e:
         # A dropped connection might well succeed against a different

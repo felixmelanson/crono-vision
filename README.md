@@ -103,6 +103,40 @@ append it as `&hint=[input]`. Or send JSON instead of a file:
 
 Set `dry_run=true` on the URL for the first few runs.
 
+## How a capture flows
+
+A plain `POST /api` runs the whole pipeline and answers once. That's what
+the Shortcut wants — one request, one notification — and it's what `log_photo`
+does.
+
+The camera page splits the same work into two requests, because it has a
+screen to keep honest:
+
+| | |
+|---|---|
+| `POST /api?phase=analyze` | Gemini, then a database search per food. Writes nothing. Returns `pending` — the items it would log, each carrying the `plan` to write. |
+| `POST /api?action=commit` | Writes those plans. Body is `{date, meal, items}` — hand back the `pending` list as-is. |
+
+The split buys two things. The detection markers can appear the moment the
+analysis lands, instead of after the diary writes, which is most of the
+stare-at-a-frozen-frame time. And a retry becomes safe: `commit` re-sends the
+grams `analyze` already settled on, so the duplicate check matches. Retrying
+the combined call re-ran vision, and a fresh estimate of 148g against a
+logged 150g slid straight past that check and logged lunch twice.
+
+Latency is mostly Gemini and always will be. The rest is kept out of the way:
+the Cronometer login runs *during* the Gemini call rather than after it, a
+batch of writes reads the day once instead of once per food, and the writes go
+out together. On a four-item plate at a 120ms round trip that's about 2.0s of
+non-Gemini overhead down to about 0.5s.
+
+Nothing in the browser runs without a deadline (`ANALYZE_TIMEOUT_MS` and
+friends in [index.html](index.html)), and Gemini's model-fallback chain has a
+total `budget`, not just a per-attempt `timeout` — four models at 60s each
+inside a function Vercel kills at 60s is how a slow Gemini used to end as a
+504 *after* the writes had landed, which looked from the phone like nothing
+happened and from Cronometer like everything did.
+
 ## What gets logged, and what doesn't
 
 Nothing is written unless three things hold: Gemini was reasonably sure what

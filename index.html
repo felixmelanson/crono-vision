@@ -500,9 +500,23 @@
 const $ = (id) => document.getElementById(id);
 
 // ── config ──────────────────────────────────────────────────────────
-const UPLOAD_MAX_EDGE = 1024;   // long edge of the uploaded JPEG
-const JPEG_QUALITY = 0.85;
+// 800px and q0.72 is roughly a third of the bytes 1024/q0.85 produced,
+// which is a third off the upload leg on a cell connection and fewer image
+// tokens for Gemini to chew through. Food identification doesn't miss it:
+// the model is reading "grilled chicken breast, about a palm's worth", not
+// counting sesame seeds.
+const UPLOAD_MAX_EDGE = 800;    // long edge of the uploaded JPEG
+const JPEG_QUALITY = 0.72;
 const LONGPRESS_MS = 450;
+
+// Nothing may hang forever. Every request below runs under one of these,
+// because the failure that actually happened in the wild wasn't an error —
+// it was a fetch that never settled at all (backgrounded PWA, dropped
+// cell) and left the shutter frozen behind an "Analyzing…" panel with no
+// way out but a reload.
+const ANALYZE_TIMEOUT_MS = 40000;
+const COMMIT_TIMEOUT_MS = 20000;
+const ACTION_TIMEOUT_MS = 15000;
 
 const state = {
   stream: null,
@@ -512,7 +526,23 @@ const state = {
   toastShowing: false,
   pressTimer: null,
   longPressFired: false,
+  processing: false,   // the frozen frame + overlay are up
+  inFlight: 0,         // requests actually outstanding
 };
+
+// fetch that always settles: either the response, or an abort we turn into
+// a normal network failure so every caller's existing catch handles it.
+async function fetchWithTimeout(url, opts, ms) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), ms);
+  state.inFlight++;
+  try {
+    return await fetch(url, { ...opts, signal: ctrl.signal });
+  } finally {
+    clearTimeout(timer);
+    state.inFlight--;
+  }
+}
 
 // ── auth ────────────────────────────────────────────────────────────
 // The token itself never touches this page's own storage — /api/auth sets
@@ -750,12 +780,14 @@ function capture() {
 // under load, and either way the person can see the exact photo that's
 // being processed the whole time, not just a generic spinner.
 function beginProcessing() {
+  state.processing = true;
   $('freeze').style.display = 'block';
   requestAnimationFrame(() => $('loadingOverlay').classList.add('show'));
 }
 // Full stop, immediately — for a failure, where there's nothing detected
 // to reveal and no reason to keep the shot up.
 function endProcessing() {
+  state.processing = false;
   $('loadingOverlay').classList.remove('show');
   $('freeze').style.display = 'none';
   $('detectLayer').innerHTML = '';
@@ -764,7 +796,13 @@ function endProcessing() {
 // longer so the corner markers can reveal against it — that's the actual
 // payoff of freezing the frame in the first place. Then it hands off to
 // the live camera on its own.
+//
+// This fires when the *analysis* lands, not when the diary writes finish.
+// The markers are a statement about what was recognised, and that fact is
+// true the moment Gemini answers; making it wait on two more round trips
+// to Cronometer bought nothing but a longer stare at a frozen frame.
 function finishProcessingWithMarkers(guesses) {
+  state.processing = false;
   $('loadingOverlay').classList.remove('show');
   showDetections(guesses);
   setTimeout(() => {
@@ -772,6 +810,18 @@ function finishProcessingWithMarkers(guesses) {
     $('detectLayer').innerHTML = '';
   }, 1600);
 }
+
+// If the page was suspended mid-request — screen locked, app switched
+// away — iOS can leave the fetch neither resolved nor rejected. Coming
+// back to a frozen frame with nothing outstanding means exactly that, and
+// the photo is still in the closure, so it costs one tap to retry.
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'visible') return;
+  if (!state.processing || state.inFlight > 0) return;
+  endProcessing();
+  pushToast('warn', 'That upload was interrupted. Nothing was logged.',
+    [{ label: 'Dismiss', action: () => {} }]);
+});
 
 // Draws a corner-bracket reticle for each item Gemini returned a bounding
 // box for — real detections, not decoration. box_2d is [ymin,xmin,ymax,xmax]
@@ -814,53 +864,120 @@ function showDetections(guesses) {
 // logged, held for review, or unmatched — all three still got detected,
 // so all three earn a marker.
 function collectGuesses(data) {
-  return [...(data.logged || []), ...(data.needs_review || []), ...(data.failed || [])]
+  const buckets = data.pending || data.logged || [];
+  return [...buckets, ...(data.needs_review || []), ...(data.failed || [])]
     .map(e => e.guess).filter(g => g && g.box_2d);
 }
 
+function sessionExpired() {
+  endProcessing();
+  state.authed = false;
+  $('login').classList.remove('hidden');
+  $('loginErr').textContent = 'Session expired — enter your token again.';
+}
+
+// Two requests, not one.
+//
+//   analyze  the slow half — Gemini, then a database search per food. As
+//            soon as it answers we can draw the markers and drop the
+//            frozen frame, because everything the person is waiting to
+//            see has now been decided.
+//   commit   the writes, which happen behind the markers.
+//
+// The old single call held the shutter frozen through both halves, so a
+// two-second Cronometer round trip read to the user as two more seconds of
+// Gemini. It also made retrying dangerous: a retry re-ran vision, and a
+// fresh portion estimate of 148g instead of 150g slipped past the
+// duplicate check and logged lunch twice. Retrying a commit re-sends the
+// grams analyze already settled on, so the check matches and the retry is
+// free.
 async function upload(blob, hint, attempt) {
-  const params = new URLSearchParams({ meal: 'auto', always_log: 'true' });
+  const params = new URLSearchParams({
+    meal: 'auto', always_log: 'true', phase: 'analyze',
+  });
   if (hint) params.set('hint', hint);
 
   const retry = () => { beginProcessing(); upload(blob, hint, attempt + 1); };
 
   let res, data;
   try {
-    res = await fetch('/api?' + params.toString(), {
+    res = await fetchWithTimeout('/api?' + params.toString(), {
       method: 'POST', credentials: 'same-origin',
       headers: { 'content-type': 'image/jpeg' },
       body: blob,
-    });
+    }, ANALYZE_TIMEOUT_MS);
     data = await res.json().catch(() => ({}));
   } catch (e) {
-    // Network-level failure (offline, dropped signal) — the blob is still
-    // in this closure, untouched, so retrying costs nothing and needs no
-    // recapture.
+    // Network-level failure, or our own abort — the blob is still in this
+    // closure, untouched, so retrying costs nothing and needs no
+    // recapture. Nothing was written either way: analyze doesn't write.
     endProcessing();
-    pushToast('bad', "Couldn't reach the server — check your connection.",
+    pushToast('bad', e.name === 'AbortError'
+      ? 'That took too long — nothing was logged.'
+      : "Couldn't reach the server — check your connection.",
       [{ label: 'Retry', action: retry }, { label: 'Dismiss', action: () => {} }]);
     return;
   }
 
-  if (res.status === 401) {
-    // Cookie expired or was rotated. Send them back to the login screen
-    // rather than silently losing the photo.
-    endProcessing();
-    state.authed = false;
-    $('login').classList.remove('hidden');
-    $('loginErr').textContent = 'Session expired — enter your token again.';
-    return;
-  }
+  if (res.status === 401) { sessionExpired(); return; }
 
   if (!data.ok) {
     endProcessing();
-    pushToast('bad', data.error || 'Something went wrong logging that.',
+    pushToast('bad', data.error || 'Something went wrong reading that photo.',
       [{ label: 'Retry', action: retry }, { label: 'Dismiss', action: () => {} }]);
     return;
   }
 
+  // Markers now — before a single byte has been written to the diary.
   finishProcessingWithMarkers(collectGuesses(data));
-  renderResult(data);
+
+  const pending = data.pending || [];
+  if (!pending.length) {
+    // Nothing confident enough to write: an empty photo, or everything
+    // landed in needs_review. renderResult already says both well.
+    renderResult({ ...data, logged: [] });
+    return;
+  }
+  commitItems(data, pending, 0);
+}
+
+// Phase two. The card only goes up once this lands, since it's the half
+// that knows the entry ids Reject and Swap need.
+async function commitItems(analysis, pending, attempt) {
+  const again = () => commitItems(analysis, pending, attempt + 1);
+
+  let res, data;
+  try {
+    res = await fetchWithTimeout('/api?action=commit', {
+      method: 'POST', credentials: 'same-origin',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        date: analysis.date, meal: analysis.meal, items: pending,
+      }),
+    }, COMMIT_TIMEOUT_MS);
+    data = await res.json().catch(() => ({}));
+  } catch (e) {
+    // Unlike analyze, this one may well have written before the connection
+    // died, so the message doesn't promise otherwise — and the retry is
+    // safe precisely because it re-sends identical plans.
+    pushToast('bad', "Couldn't confirm that was logged — check your diary.",
+      [{ label: 'Retry', action: again }, { label: 'Dismiss', action: () => {} }]);
+    return;
+  }
+
+  if (res.status === 401) { sessionExpired(); return; }
+
+  if (!data.ok) {
+    pushToast('bad', data.error || 'Something went wrong logging that.',
+      [{ label: 'Retry', action: again }, { label: 'Dismiss', action: () => {} }]);
+    return;
+  }
+
+  renderResult({
+    ...analysis,
+    logged: data.logged || [],
+    failed: [...(analysis.failed || []), ...(data.failed || [])],
+  });
 }
 
 // ── result → toast ───────────────────────────────────────────────────
@@ -959,8 +1076,8 @@ function shortFallbackText(review, failed) {
 
 async function undoEntry(entryId, date, label, silent) {
   try {
-    const r = await fetch(`/api?entry_id=${entryId}&date=${encodeURIComponent(date)}`,
-      { method: 'DELETE', credentials: 'same-origin' });
+    const r = await fetchWithTimeout(`/api?entry_id=${entryId}&date=${encodeURIComponent(date)}`,
+      { method: 'DELETE', credentials: 'same-origin' }, ACTION_TIMEOUT_MS);
     const j = await r.json();
     if (!silent) {
       pushToast(r.ok && j.ok ? 'ok' : 'bad',
@@ -976,14 +1093,14 @@ async function undoEntry(entryId, date, label, silent) {
 
 async function swapEntry(entryId, date, alt, grams, meal, newLabel) {
   try {
-    const r = await fetch('/api?action=swap', {
+    const r = await fetchWithTimeout('/api?action=swap', {
       method: 'POST', credentials: 'same-origin',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
         entry_id: entryId, date, meal,
         food_id: alt.food_id, measure_id: alt.measure_id, grams,
       }),
-    });
+    }, ACTION_TIMEOUT_MS);
     const j = await r.json();
     pushToast(r.ok && j.ok ? 'ok' : 'bad',
       r.ok && j.ok ? 'Swapped to ' + newLabel + '.' : (j.error || 'Could not swap that.'),

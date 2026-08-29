@@ -20,6 +20,16 @@ sending the cookie /api/auth sets after a one-time login, so the token never
 lives in that page's own JS. Both this file and that one check
 webauth.is_authorized(), which accepts either.
 
+A plain POST runs the whole thing and answers once, which is what the
+Shortcut wants. The camera page splits it in two so it can show the person
+their food was recognised without waiting on the diary writes:
+
+  POST   /api?phase=analyze              — vision + matching, writes nothing.
+                                            Returns `pending`, each item
+                                            carrying the plan to write.
+  POST   /api?action=commit  (JSON body) — writes those plans. Body is
+                                            {date, meal, items: [...]}.
+
 This file also handles the two actions the capture page needs after a log:
   DELETE /api?entry_id=X&date=Y          — undo: remove one diary entry.
   POST   /api?action=swap  (JSON body)   — swap: remove one entry, add another
@@ -42,12 +52,15 @@ from urllib.parse import parse_qs, urlparse
 # so the shared modules one level up need an explicit nudge.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from pipeline import log_photo  # noqa: E402
+from pipeline import analyze, commit, log_photo  # noqa: E402
 from vision import VisionError  # noqa: E402
 from cronometer_client import CronometerAuthError, CronometerClient, CronometerError  # noqa: E402
 from webauth import is_authorized  # noqa: E402
 
 MAX_IMAGE_BYTES = 8 * 1024 * 1024  # comfortably above an iPhone photo
+# A commit body is analyze's own output handed back, match alternatives
+# and all — small, but not swap-sized.
+MAX_COMMIT_BYTES = 256 * 1024
 
 
 class handler(BaseHTTPRequestHandler):
@@ -58,8 +71,10 @@ class handler(BaseHTTPRequestHandler):
             params = {k: v[0] for k, v in parse_qs(urlparse(self.path).query).items()}
             if params.get("action") == "swap":
                 self._handle_swap()
+            elif params.get("action") == "commit":
+                self._handle_commit()
             else:
-                self._handle_log()
+                self._handle_log(analyze_only=params.get("phase") == "analyze")
         except Exception:  # noqa: BLE001 - last line of defence
             traceback.print_exc()
             self._json(500, {"ok": False, "error": "Internal error. Check the function logs."})
@@ -117,7 +132,7 @@ class handler(BaseHTTPRequestHandler):
 
     # -- request handling ---------------------------------------------
 
-    def _handle_log(self) -> None:
+    def _handle_log(self, analyze_only: bool = False) -> None:
         if not is_authorized(self.headers):
             self._json(401, {"ok": False, "error": "Unauthorized"})
             return
@@ -155,18 +170,29 @@ class handler(BaseHTTPRequestHandler):
             # Shortcuts sends when the body is a file.
             image = body
 
+        common = {
+            "date": params.get("date"),
+            "meal": params.get("meal"),
+            "hint": params.get("hint") or params.get("note"),
+            # Off by default (the Shortcut's original conservative
+            # behavior); the camera page passes always_log=true since
+            # its undo/swap UI is what makes logging-while-unsure safe.
+            "always_log_uncertain": _truthy(params.get("always_log")),
+        }
+
         try:
-            result = log_photo(
-                image,
-                date=params.get("date"),
-                meal=params.get("meal"),
-                hint=params.get("hint") or params.get("note"),
-                dry_run=_truthy(params.get("dry_run")),
-                # Off by default (the Shortcut's original conservative
-                # behavior); the camera page passes always_log=true since
-                # its undo/swap UI is what makes logging-while-unsure safe.
-                always_log_uncertain=_truthy(params.get("always_log")),
-            )
+            if analyze_only:
+                # Phase one: everything up to the writes. The camera page
+                # takes this so it can draw its detection markers while the
+                # diary writes are still in flight, instead of holding a
+                # frozen frame until the whole thing is done.
+                result = analyze(image, **common)
+            else:
+                result = log_photo(
+                    image,
+                    dry_run=_truthy(params.get("dry_run")),
+                    **common,
+                )
         except VisionError as e:
             self._json(502, {"ok": False, "error": str(e), "stage": "vision"})
             return
@@ -181,8 +207,81 @@ class handler(BaseHTTPRequestHandler):
             return
 
         # `summary` first and flat, so a Shortcut can read it without
-        # digging through nested JSON to show a notification.
-        self._json(200, {"ok": True, "summary": result["summary"], **result})
+        # digging through nested JSON to show a notification. The analyze
+        # phase has no summary to give — nothing has happened yet.
+        head = {"ok": True}
+        if "summary" in result:
+            head["summary"] = result["summary"]
+        self._json(200, {**head, **result})
+
+    def _handle_commit(self) -> None:
+        """POST /api?action=commit — phase two: write what analyze resolved.
+
+        Body: {date, meal, items: [<pending entry from analyze>, ...]}. The
+        entries go back out whole, so the page keeps the guess and match
+        data it already has and only gains the entry ids.
+
+        The plans are trusted the same way swap's are: this is the account
+        owner's own session writing to their own diary, and a food_id is
+        not a capability. What is checked is that each one is well-formed,
+        so a mangled body fails here rather than halfway through a batch.
+        """
+        if not is_authorized(self.headers):
+            self._json(401, {"ok": False, "error": "Unauthorized"})
+            return
+
+        length = int(self.headers.get("content-length") or 0)
+        if length <= 0 or length > MAX_COMMIT_BYTES:
+            self._json(400, {"ok": False, "error": "Missing or oversized body"})
+            return
+        try:
+            body = json.loads(self.rfile.read(length))
+        except ValueError:
+            self._json(400, {"ok": False, "error": "Body was not valid JSON"})
+            return
+
+        items = body.get("items")
+        if not isinstance(items, list):
+            self._json(400, {"ok": False, "error": "Body needs an 'items' list"})
+            return
+        if not items:
+            self._json(200, {"ok": True, "logged": [], "failed": []})
+            return
+
+        plans = []
+        for item in items:
+            plan = (item or {}).get("plan") or {}
+            try:
+                clean = {
+                    "food_id": int(plan["food_id"]),
+                    "measure_id": int(plan["measure_id"]),
+                    "grams": float(plan["grams"]),
+                    "food_name": str(plan.get("food_name") or ""),
+                }
+            except (AttributeError, KeyError, TypeError, ValueError):
+                self._json(400, {"ok": False,
+                                 "error": "Each item needs a plan with food_id, "
+                                          "measure_id and grams"})
+                return
+            if clean["grams"] <= 0:
+                self._json(400, {"ok": False, "error": "grams must be positive"})
+                return
+            plans.append({**item, "plan": clean})
+
+        client = CronometerClient()
+        try:
+            logged, failed = commit(plans, date=body.get("date"),
+                                    meal=body.get("meal"), client=client)
+        except CronometerAuthError as e:
+            self._json(401, {"ok": False, "error": str(e), "stage": "cronometer_auth"})
+            return
+        except CronometerError as e:
+            self._json(502, {"ok": False, "error": str(e), "stage": "cronometer"})
+            return
+        finally:
+            client.close()
+
+        self._json(200, {"ok": True, "logged": logged, "failed": failed})
 
     def _handle_undo(self) -> None:
         """DELETE /api?entry_id=X&date=Y — the toast's "undo" tap."""
