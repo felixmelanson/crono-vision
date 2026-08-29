@@ -23,7 +23,7 @@ import httpx
 
 import pipeline
 import vision
-from cronometer_client import CronometerClient
+from cronometer_client import CronometerClient, group_name, resolve_diary_group
 
 _failures = []
 
@@ -139,20 +139,21 @@ check("two servings written", len(added), 2)
 check("grams passed through", added[0]["grams"], 185.0)
 check("measure id passed through", added[0]["measureId"], 1000)
 check("date passed through", added[0]["day"], "2026-08-28")
-check("vision's meal guess used when caller is silent", res["meal"], "dinner")
-check("diary group on the serving", added[0]["diaryGroup"], 3)
+# Meal is clock-time only now (see pipeline.py) — Gemini's own read of the
+# food is deliberately ignored here, so this has to match whatever the
+# clock says right now rather than a fixed fixture value like "dinner".
+now_meal = group_name(resolve_diary_group("auto"))
+check("no explicit meal -> pure clock time", res["meal"], now_meal)
+check("diary group on the serving matches that clock bucket",
+      added[0]["diaryGroup"], resolve_diary_group("auto"))
 
 # The web page always sends meal="auto" explicitly (never omits it), so
-# that literal string has to behave exactly like not passing meal at all
-# — it must not silently beat Gemini's own guess the way any other
-# non-empty string correctly would. This regressed once already: "auto"
-# was truthy, so `meal or analysis.meal` picked it every time, and a late
-# dinner photo landed in snacks purely on clock time.
+# that literal string has to behave exactly like not passing meal at all.
 added.clear()
 res = pipeline.log_photo(b"\xff\xd8\xfffake-jpeg", date="2026-08-28", meal="auto",
                          client=fresh_client())
-check("meal='auto' still defers to vision's guess", res["meal"], "dinner")
-check("order packs the group", added[0]["order"], (3 << 16) | 1)
+check("meal='auto' behaves like no meal at all", res["meal"], now_meal)
+check("order packs the group", added[0]["order"], (resolve_diary_group("auto") << 16) | 1)
 check("entry id returned", res["logged"][0]["entry"]["entry_id"], 900)
 check("daily totals attached", res["daily"]["consumed"]["calories"], 780.0)
 check("remaining computed", res["daily"]["remaining"]["calories"], 1420.0)

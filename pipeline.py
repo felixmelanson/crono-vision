@@ -63,17 +63,19 @@ def log_photo(
     if not analysis.items:
         return _empty_result(day, meal, analysis, "No food found in that photo.")
 
-    # Meal precedence: caller's explicit choice, then what the food looks
-    # like, then the clock. "auto" is a sentinel for "no real preference",
-    # same as not passing meal at all — it must NOT short-circuit past
-    # Gemini's own guess the way any other truthy string correctly would.
-    # (This was silently always winning: the web page always sends
-    # meal=auto explicitly, so analysis.meal was dead code — a plate
-    # Gemini clearly reads as dinner still fell back to pure clock time,
-    # which is wrong specifically for the case this fallback exists for:
-    # a late meal that IS a real meal, not a snack just because it's late.)
+    # Meal precedence: caller's explicit choice, else the clock. "auto" is
+    # a sentinel for "no real preference", same as not passing meal at all.
+    #
+    # This deliberately ignores what Gemini thinks the food looks like
+    # (analysis.meal) even though it's right there — that was tried, and
+    # produced exactly the surprise it sounds like: a steak dinner
+    # photographed at 12:27am logged as "lunch" because the plate read as
+    # a lunch-type meal, while a can of soda at the same hour logged as a
+    # snack. Every other diet tracker buckets by time slot, not food
+    # content, and that's the less surprising default — "late dinner"
+    # beats "lunch at 1am" even when the plate genuinely looks like lunch.
     explicit_meal = meal if meal and meal.strip().lower() != "auto" else None
-    chosen_meal = explicit_meal or (analysis.meal if analysis.meal in ("breakfast", "lunch", "dinner", "snacks") else "auto")
+    chosen_meal = explicit_meal or "auto"
     group_id = resolve_diary_group(chosen_meal)
     meal_label = group_name(group_id)
 
