@@ -1,0 +1,822 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Crono">
+<meta name="theme-color" content="#0a0806">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/icon-180.png">
+<title>crono-vision</title>
+<style>
+  :root {
+    /* Warm near-black + copper, echoing the logo mark. Glass panels use
+       --glass-* rather than a flat --panel, since the whole point of the
+       frosted look is that the tint is translucent — backdrop-filter does
+       the actual blurring, this is just the color riding on top of it. */
+    --bg: #0a0806;
+    --glass-bg: rgba(24,18,14,.46); --glass-line: rgba(255,255,255,.12);
+    --text: #f5ede4; --dim: #b8a99b;
+    --ok: #4ade80; --ok-bg: rgba(20,42,26,.55); --ok-line: rgba(74,222,128,.35);
+    --warn: #fbbf24; --warn-bg: rgba(42,34,16,.55); --warn-line: rgba(251,191,36,.35);
+    --bad: #f87171; --bad-bg: rgba(42,18,18,.55); --bad-line: rgba(248,113,113,.35);
+    --copper-1: #ff9248; --copper-2: #c2540d; --copper-line: rgba(255,146,72,.55);
+    --copper-glow: rgba(255,138,61,.65);
+    color-scheme: dark;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; user-select: none; }
+  html, body { height: 100%; overscroll-behavior: none; }
+  body {
+    margin: 0; background: #000; color: var(--text);
+    font: 15px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    overflow: hidden;
+  }
+
+  /* Two frosted-glass recipes, not one flat tint. Plain blur+translucency
+     reads as "dirty transparent" rather than glass — what actually sells
+     it is a bright inset line along the top edge (light catching the rim)
+     paired with a dark inset line along the bottom (the shadow glass
+     itself casts), plus an outer drop shadow so the panel reads as
+     something floating above the scene rather than painted onto it.
+     No SVG displacement filter here on purpose — Safari doesn't support
+     backdrop-filter referencing an SVG filter, so url(#foo) falls back to
+     no blur at all there (fully transparent, invisible panels). Plain
+     blur()/saturate()/brightness() functions all work fine everywhere.
+
+     -light: for outer containers/sheets — barely-there tint, mostly the
+     shadow and highlight lines doing the work.
+     -dark: for things that need to stay legible over a bright or busy
+     background (the toast, in particular) — same recipe, denser tint. */
+  .glass-light {
+    background: rgba(255,255,255,.03);
+    -webkit-backdrop-filter: blur(28px) saturate(130%) brightness(.92);
+    backdrop-filter: blur(28px) saturate(130%) brightness(.92);
+    border: 1px solid rgba(255,255,255,.2);
+    box-shadow:
+      0 0 0 .5px rgba(255,255,255,.15) inset,
+      0 1.5px 0 rgba(255,255,255,.22) inset,
+      0 -1px 0 rgba(0,0,0,.45) inset,
+      0 14px 28px rgba(0,0,0,.55);
+  }
+  .glass-dark {
+    background: rgba(13,10,7,.68);
+    -webkit-backdrop-filter: blur(22px) saturate(60%) brightness(.7);
+    backdrop-filter: blur(22px) saturate(60%) brightness(.7);
+    border: 1px solid rgba(255,255,255,.09);
+    box-shadow:
+      0 1px 0 rgba(255,255,255,.1) inset,
+      0 -1px 0 rgba(0,0,0,.3) inset,
+      0 10px 26px rgba(0,0,0,.5);
+  }
+  .copper-btn {
+    background: linear-gradient(135deg, var(--copper-1), var(--copper-2));
+    border: 1px solid var(--copper-line);
+    box-shadow: 0 2px 12px -2px var(--copper-glow);
+  }
+
+  /* ── camera layer ─────────────────────────────────────────────── */
+  #camWrap { position: fixed; inset: 0; background: #000; }
+  video, #freeze {
+    position: absolute; inset: 0; width: 100%; height: 100%;
+    object-fit: cover; background: #000;
+  }
+  #freeze { display: none; }
+  #camMsg {
+    position: absolute; inset: 0; display: none; align-items: center;
+    justify-content: center; text-align: center; padding: 32px;
+    color: var(--dim); font-size: 15px; line-height: 1.6;
+  }
+  #camMsg.show { display: flex; }
+  #camMsg button {
+    margin-top: 14px; padding: 10px 20px; border-radius: 10px;
+    color: var(--text); font: inherit; font-weight: 600;
+  }
+
+  /* subtle top/bottom gradients so white UI text stays legible over any photo */
+  .scrim-top, .scrim-bottom {
+    position: fixed; left: 0; right: 0; pointer-events: none; z-index: 1;
+  }
+  .scrim-top { top: 0; height: 160px; background: linear-gradient(#000c, transparent); }
+  .scrim-bottom { bottom: 0; height: 260px; background: linear-gradient(transparent, #000d); }
+
+  /* ── top navbar: logo + daily totals ─────────────────────────── */
+  /* The wrapper positions the bar with real clearance from the top edge
+     (a floating island, not a bar fused to the status bar) — it carries
+     no background of its own, only padding, so the actual glass panel
+     inside it is what floats. */
+  #navbarWrap {
+    position: fixed; top: 0; left: 0; right: 0; z-index: 2;
+    padding: max(14px, env(safe-area-inset-top)) 14px 0;
+    pointer-events: none;
+  }
+  #navbar {
+    pointer-events: auto; overflow: hidden;
+    height: 68px; padding: 9px 16px; border-radius: 18px;
+    display: flex; align-items: center; gap: 12px;
+  }
+  /* No background tile behind it — the mark sits directly on the glass,
+     sized to the bar's own inner height (padding included) rather than
+     floating as a small icon within it. No glow either — drop-shadow's
+     blur has nowhere to go with the logo already filling the row edge to
+     edge, so it was reading as a hard rectangular seam, not a soft glow. */
+  #navLogo { height: 100%; width: auto; object-fit: contain; }
+  #navDivider { width: 1px; height: 26px; background: rgba(255,255,255,.14); flex: 0 0 auto; }
+  #navStats {
+    font-size: 12.5px; color: var(--dim); display: flex; gap: 12px;
+    white-space: nowrap; opacity: 0; transition: opacity .3s;
+  }
+  #navStats.show { opacity: 1; }
+  #navStats b { color: var(--text); font-weight: 600; }
+
+  /* ── shutter ──────────────────────────────────────────────────── */
+  #shutterWrap {
+    position: fixed; left: 0; right: 0;
+    bottom: max(28px, env(safe-area-inset-bottom));
+    display: flex; align-items: center; justify-content: center; z-index: 2;
+  }
+  /* Same recipe family as .glass-light, brightened — a light frosted disc
+     rather than a flat white button. The inset highlight along the top
+     is what actually reads as "glass" here; without it this is just a
+     translucent gray circle. */
+  #shutter {
+    width: 76px; height: 76px; border-radius: 50%;
+    background: rgba(255,255,255,.12);
+    -webkit-backdrop-filter: blur(22px) saturate(140%) brightness(1.15);
+    backdrop-filter: blur(22px) saturate(140%) brightness(1.15);
+    border: 1px solid rgba(255,255,255,.32);
+    box-shadow:
+      0 1px 0 rgba(255,255,255,.4) inset,
+      0 -1px 0 rgba(0,0,0,.15) inset,
+      0 8px 22px rgba(0,0,0,.4);
+    transition: transform .1s, background .15s;
+  }
+  #shutter:active, #shutter.pressed { transform: scale(.9); background: rgba(255,255,255,.24); }
+  #shutter.disabled { opacity: .4; }
+  #shutterHint {
+    position: fixed; bottom: max(118px, calc(env(safe-area-inset-bottom) + 118px));
+    left: 0; right: 0; text-align: center; z-index: 2;
+    color: var(--dim); font-size: 12px; opacity: 0; transition: opacity .3s;
+    pointer-events: none;
+  }
+  #shutterHint.show { opacity: 1; }
+
+  /* ── hint overlay (long-press) ────────────────────────────────── */
+  #hintSheet {
+    position: fixed; inset: 0; z-index: 5; display: none;
+    align-items: flex-end; background: #000a;
+  }
+  #hintSheet.show { display: flex; }
+  #hintPanel {
+    width: 100%; border-radius: 20px 20px 0 0; border-bottom: none;
+    padding: 18px 18px max(18px, env(safe-area-inset-bottom));
+  }
+  #hintPanel h3 { margin: 0 0 4px; font-size: 15px; }
+  #hintPanel p { margin: 0 0 12px; color: var(--dim); font-size: 12.5px; }
+  #hintInput {
+    width: 100%; padding: 12px 14px; border-radius: 12px; border: 1px solid var(--glass-line);
+    background: rgba(0,0,0,.35); color: var(--text); font: inherit; font-size: 16px; /* 16px: iOS won't zoom-in on focus */
+  }
+  #hintBtns { display: flex; gap: 8px; margin-top: 12px; }
+  #hintBtns button {
+    flex: 1; padding: 12px; border-radius: 12px; font: inherit; font-weight: 600;
+    border: 1px solid var(--glass-line); background: rgba(255,255,255,.08); color: var(--text);
+  }
+  #hintBtns button.primary { border: none; }
+
+  /* ── toast ────────────────────────────────────────────────────── */
+  /* No color on the card itself, anywhere — the only status signal is a
+     small glowing dot next to the text. This card doesn't time out: it
+     sits on screen until Confirm/Edit/Reject actually resolves it, so
+     there's always time to read it and act. */
+  #toast {
+    position: fixed; left: 12px; right: 12px;
+    bottom: max(122px, calc(env(safe-area-inset-bottom) + 122px));
+    z-index: 4; border-radius: 16px;
+    padding: 14px 16px; font-size: 13.5px; line-height: 1.45; color: var(--text);
+    transform: translateY(12px); opacity: 0; pointer-events: none;
+    transition: transform .25s, opacity .25s;
+  }
+  #toast.show { transform: translateY(0); opacity: 1; pointer-events: auto; }
+  /* The dot only sits on the header line — it used to wrap the whole
+     message in a flex row, which indented every row under it by the
+     dot's width+gap for no reason. Rows below are flush with the card's
+     own padding, nothing else is shifted over. */
+  #toastMsg { margin-bottom: 10px; }
+  #toastHeader {
+    display: flex; align-items: center; gap: 8px;
+    font-size: 11px; font-weight: 700; letter-spacing: .07em; text-transform: uppercase;
+    color: var(--dim); margin-bottom: 7px;
+  }
+  /* Simple one-line confirmations ("Removed X.") use the same dot+row
+     shell but read as a normal sentence, not a section label. */
+  #toastHeader.plain {
+    font-size: 13.5px; font-weight: 500; letter-spacing: normal;
+    text-transform: none; color: var(--text); margin-bottom: 0;
+  }
+  #toastDot {
+    flex: 0 0 auto; width: 7px; height: 7px; border-radius: 50%; background: var(--dim);
+  }
+  #toast.ok   #toastDot { background: var(--ok);   box-shadow: 0 0 8px var(--ok); }
+  #toast.warn #toastDot { background: var(--warn); box-shadow: 0 0 8px var(--warn); }
+  #toast.bad  #toastDot { background: var(--bad);  box-shadow: 0 0 8px var(--bad); }
+  .toastRow {
+    display: flex; justify-content: space-between; align-items: baseline;
+    gap: 12px; padding: 4px 0;
+  }
+  .toastRow + .toastRow { border-top: 1px solid rgba(255,255,255,.06); }
+  .toastRowName { font-weight: 600; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .toastRowMeta { flex: 0 0 auto; color: var(--dim); font-size: 12px; white-space: nowrap; }
+  #toastBtns { display: flex; gap: 8px; flex-wrap: wrap; }
+  #toastBtns button {
+    padding: 8px 14px; border-radius: 10px; font: inherit; font-size: 12.5px;
+    font-weight: 700; letter-spacing: .01em;
+    background: rgba(255,255,255,.07); border: 1px solid rgba(255,255,255,.16);
+    color: var(--text);
+  }
+  #toastBtns button:active { background: rgba(255,255,255,.18); }
+  #toastBtns button.primary { background: rgba(255,255,255,.15); border-color: rgba(255,255,255,.3); }
+
+  /* ── login screen ─────────────────────────────────────────────── */
+  #login {
+    position: fixed; inset: 0; z-index: 10;
+    background:
+      radial-gradient(ellipse 90% 60% at 50% 8%, rgba(255,138,61,.16), transparent 60%),
+      var(--bg);
+    display: flex; align-items: center; justify-content: center; padding: 24px;
+  }
+  #login.hidden { display: none; }
+  #loginCard {
+    width: 100%; max-width: 320px; text-align: center;
+    border-radius: 22px; padding: 30px 26px;
+  }
+  #loginLogo {
+    width: 72px; height: 72px; margin: 0 auto 16px;
+    filter: drop-shadow(0 0 22px var(--copper-glow));
+  }
+  #loginCard h1 { font-size: 19px; margin: 0 0 6px; letter-spacing: -.01em; }
+  #loginCard p { color: var(--dim); font-size: 13px; margin: 0 0 20px; }
+  #loginInput {
+    width: 100%; padding: 13px 14px; border-radius: 12px; border: 1px solid var(--glass-line);
+    background: rgba(0,0,0,.35); color: var(--text); font: inherit; font-size: 16px;
+    text-align: center; letter-spacing: .03em;
+  }
+  #loginBtn {
+    width: 100%; margin-top: 10px; padding: 13px; border-radius: 12px;
+    color: #1a0f06; font: inherit; font-weight: 700; font-size: 15px;
+  }
+  #loginBtn:disabled { opacity: .5; }
+  #loginErr { color: var(--bad); font-size: 12.5px; margin-top: 10px; min-height: 1em; }
+
+  /* ── processing overlay (capture feedback) ───────────────────────
+     Replaces a fixed-duration animation with one that actually tracks
+     the request: the frozen shot stays up, this glass panel appears
+     centered on top of it, and both hold for exactly as long as the
+     upload takes — a few hundred ms on a fast response, several seconds
+     if Gemini's under load — rather than always finishing in the same
+     640ms regardless of whether the real answer has come back yet. */
+  #loadingOverlay {
+    position: absolute; inset: 0; z-index: 2;
+    display: flex; align-items: center; justify-content: center;
+    opacity: 0; pointer-events: none; transition: opacity .3s;
+  }
+  #loadingOverlay.show { opacity: 1; }
+  #loadingPanel {
+    display: flex; flex-direction: column; align-items: center; gap: 13px;
+    padding: 28px 36px; border-radius: 20px;
+    transform: scale(.85); transition: transform .4s cubic-bezier(.34,1.4,.64,1);
+  }
+  #loadingOverlay.show #loadingPanel { transform: scale(1); }
+  #loadingSpinner {
+    width: 28px; height: 28px; border-radius: 50%;
+    border: 2.5px solid rgba(255,255,255,.16); border-top-color: rgba(255,255,255,.85);
+    animation: spin .8s linear infinite;
+  }
+  #loadingLabel { font-size: 12.5px; color: var(--dim); font-weight: 600; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+
+<div id="camWrap">
+  <video id="v" playsinline muted autoplay></video>
+  <canvas id="freeze"></canvas>
+  <div id="loadingOverlay">
+    <div id="loadingPanel" class="glass-light">
+      <div id="loadingSpinner"></div>
+      <div id="loadingLabel">Analyzing…</div>
+    </div>
+  </div>
+  <div id="camMsg"><div>
+    <div id="camMsgText">Starting camera…</div>
+    <button id="camRetry" class="copper-btn" hidden>Try again</button>
+  </div></div>
+</div>
+<div class="scrim-top"></div>
+<div class="scrim-bottom"></div>
+
+<div id="navbarWrap">
+  <div id="navbar" class="glass-light">
+    <img id="navLogo" src="/assets/logo.png" alt="crono-vision">
+    <div id="navDivider"></div>
+    <div id="navStats"></div>
+  </div>
+</div>
+
+<div id="shutterHint">Hold to add a note</div>
+<div id="shutterWrap"><button id="shutter" aria-label="Capture"></button></div>
+
+<div id="toast" class="glass-dark">
+  <div id="toastMsg"></div>
+  <div id="toastBtns"></div>
+</div>
+
+<div id="hintSheet">
+  <div id="hintPanel" class="glass-light">
+    <h3>Add a note</h3>
+    <p>Anything that helps — a size, a brand, what's under the sauce. Beats guessing from the photo alone.</p>
+    <input id="hintInput" type="text" placeholder="e.g. the chicken is about 200g" enterkeyhint="done">
+    <div id="hintBtns">
+      <button id="hintCancel">Cancel</button>
+      <button id="hintDone" class="primary copper-btn">Attach & shoot</button>
+    </div>
+  </div>
+</div>
+
+<div id="login">
+  <div id="loginCard" class="glass-light">
+    <img id="loginLogo" src="/assets/logo.png" alt="">
+    <h1>crono-vision</h1>
+    <p>Enter your access token once — it's remembered on this device.</p>
+    <input id="loginInput" type="password" placeholder="Access token" autocomplete="off"
+           autocapitalize="off" autocorrect="off" spellcheck="false" enterkeyhint="done">
+    <button id="loginBtn" class="copper-btn">Unlock</button>
+    <div id="loginErr"></div>
+  </div>
+</div>
+
+<script>
+'use strict';
+
+const $ = (id) => document.getElementById(id);
+
+// ── config ──────────────────────────────────────────────────────────
+const UPLOAD_MAX_EDGE = 1024;   // long edge of the uploaded JPEG
+const JPEG_QUALITY = 0.85;
+const LONGPRESS_MS = 450;
+
+const state = {
+  stream: null,
+  authed: false,
+  pendingHint: '',
+  toastQueue: [],
+  toastShowing: false,
+  pressTimer: null,
+  longPressFired: false,
+};
+
+// ── auth ────────────────────────────────────────────────────────────
+// The token itself never touches this page's own storage — /api/auth sets
+// an HttpOnly cookie the browser attaches automatically. All this page
+// does is ask "am I authed?" and, if not, collect the token once and hand
+// it to that endpoint.
+
+async function checkAuth() {
+  try {
+    const r = await fetch('/api/auth', { credentials: 'same-origin' });
+    const j = await r.json();
+    return !!j.authed;
+  } catch (e) {
+    return false;
+  }
+}
+
+async function login(token) {
+  const r = await fetch('/api/auth', {
+    method: 'POST', credentials: 'same-origin',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ token })
+  });
+  const j = await r.json().catch(() => ({}));
+  return { ok: r.ok && j.authed, error: j.error };
+}
+
+async function boot() {
+  state.authed = await checkAuth();
+  if (state.authed) {
+    $('login').classList.add('hidden');
+    startCamera();
+  }
+  // else: login screen (visible by default) stays up.
+}
+
+$('loginBtn').onclick = async () => {
+  const token = $('loginInput').value.trim();
+  if (!token) return;
+  $('loginBtn').disabled = true;
+  $('loginErr').textContent = '';
+  const res = await login(token);
+  $('loginBtn').disabled = false;
+  if (res.ok) {
+    $('login').classList.add('hidden');
+    startCamera();
+  } else {
+    $('loginErr').textContent = res.error || 'Wrong token — try again.';
+    $('loginInput').select();
+  }
+};
+$('loginInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('loginBtn').click(); });
+
+// ── camera ──────────────────────────────────────────────────────────
+
+async function startCamera() {
+  showCamMsg('Starting camera…', false);
+  try {
+    if (state.stream) state.stream.getTracks().forEach(t => t.stop());
+    state.stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 } },
+      audio: false
+    });
+    const v = $('v');
+    v.srcObject = state.stream;
+    await v.play().catch(() => {});
+    hideCamMsg();
+    checkDailyTotals();
+  } catch (e) {
+    showCamMsg(
+      e.name === 'NotAllowedError'
+        ? "No camera access. If you already denied it, re-enable it in Settings → Safari → Camera, or in this app's entry under iOS Settings."
+        : 'Camera unavailable: ' + e.message,
+      true
+    );
+  }
+}
+
+function showCamMsg(text, withRetry) {
+  $('camMsgText').textContent = text;
+  $('camRetry').hidden = !withRetry;
+  $('camMsg').classList.add('show');
+}
+function hideCamMsg() { $('camMsg').classList.remove('show'); }
+$('camRetry').onclick = startCamera;
+
+// Coming back from the background: iOS can suspend the track while the
+// page is hidden, and it doesn't always resume itself.
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden || !state.authed) return;
+  const t = state.stream && state.stream.getVideoTracks()[0];
+  if (!t || t.readyState !== 'live') startCamera();
+});
+
+// ── shutter: tap to capture, hold to attach a note first ────────────
+
+const shutter = $('shutter');
+
+function pressStart(e) {
+  if (shutter.classList.contains('disabled')) return;
+  state.longPressFired = false;
+  shutter.classList.add('pressed');
+  state.pressTimer = setTimeout(() => {
+    state.longPressFired = true;
+    shutter.classList.remove('pressed');
+    openHintSheet();
+  }, LONGPRESS_MS);
+}
+function pressEnd(e) {
+  clearTimeout(state.pressTimer);
+  shutter.classList.remove('pressed');
+  if (!state.longPressFired) capture();
+}
+shutter.addEventListener('touchstart', (e) => { e.preventDefault(); pressStart(e); }, { passive: false });
+shutter.addEventListener('touchend', (e) => { e.preventDefault(); pressEnd(e); });
+shutter.addEventListener('touchcancel', () => { clearTimeout(state.pressTimer); shutter.classList.remove('pressed'); });
+shutter.addEventListener('mousedown', pressStart);
+shutter.addEventListener('mouseup', pressEnd);
+
+// Nudge that holding does something, the first few times only.
+if (!localStorage.getItem('cv-seen-hint-tip')) {
+  $('shutterHint').classList.add('show');
+  setTimeout(() => $('shutterHint').classList.remove('show'), 4000);
+  try { localStorage.setItem('cv-seen-hint-tip', '1'); } catch (e) {}
+}
+
+function openHintSheet() {
+  $('hintInput').value = state.pendingHint;
+  $('hintSheet').classList.add('show');
+  setTimeout(() => $('hintInput').focus(), 50);
+}
+function closeHintSheet() { $('hintSheet').classList.remove('show'); $('hintInput').blur(); }
+$('hintCancel').onclick = closeHintSheet;
+$('hintDone').onclick = () => {
+  state.pendingHint = $('hintInput').value.trim();
+  closeHintSheet();
+  capture();
+};
+$('hintInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('hintDone').click(); });
+
+// ── capture → upload ─────────────────────────────────────────────────
+// The blob lives only in memory, and only until the upload confirms. It
+// never touches the camera roll and there's nothing to delete afterward,
+// because nothing was ever saved anywhere to begin with.
+
+function capture() {
+  const v = $('v');
+  if (!v.videoWidth) return; // camera not actually live yet
+
+  const scale = Math.min(1, UPLOAD_MAX_EDGE / Math.max(v.videoWidth, v.videoHeight));
+  const w = Math.round(v.videoWidth * scale), h = Math.round(v.videoHeight * scale);
+  const c = $('freeze');
+  c.width = w; c.height = h;
+  c.getContext('2d').drawImage(v, 0, 0, w, h);
+
+  beginProcessing();
+
+  const hint = state.pendingHint;
+  state.pendingHint = ''; // one-shot: doesn't silently reapply to the next photo
+
+  c.toBlob((blob) => {
+    if (!blob) {
+      endProcessing();
+      pushToast('bad', "Couldn't process that photo — try again.",
+        [{ label: 'Dismiss', action: () => {} }]);
+      return;
+    }
+    upload(blob, hint, 0);
+  }, 'image/jpeg', JPEG_QUALITY);
+}
+
+// The frozen shot + the glass "Analyzing…" panel hold for exactly as long
+// as the real request takes — not a fixed animation length. That's the
+// point: a few hundred ms most of the time, several seconds if Gemini's
+// under load, and either way the person can see the exact photo that's
+// being processed the whole time, not just a generic spinner.
+function beginProcessing() {
+  $('freeze').style.display = 'block';
+  requestAnimationFrame(() => $('loadingOverlay').classList.add('show'));
+}
+function endProcessing() {
+  $('loadingOverlay').classList.remove('show');
+  $('freeze').style.display = 'none';
+}
+
+async function upload(blob, hint, attempt) {
+  const params = new URLSearchParams({ meal: 'auto', always_log: 'true' });
+  if (hint) params.set('hint', hint);
+
+  const retry = () => { beginProcessing(); upload(blob, hint, attempt + 1); };
+
+  let res, data;
+  try {
+    res = await fetch('/api?' + params.toString(), {
+      method: 'POST', credentials: 'same-origin',
+      headers: { 'content-type': 'image/jpeg' },
+      body: blob,
+    });
+    data = await res.json().catch(() => ({}));
+  } catch (e) {
+    // Network-level failure (offline, dropped signal) — the blob is still
+    // in this closure, untouched, so retrying costs nothing and needs no
+    // recapture.
+    endProcessing();
+    pushToast('bad', "Couldn't reach the server — check your connection.",
+      [{ label: 'Retry', action: retry }, { label: 'Dismiss', action: () => {} }]);
+    return;
+  }
+
+  if (res.status === 401) {
+    // Cookie expired or was rotated. Send them back to the login screen
+    // rather than silently losing the photo.
+    endProcessing();
+    state.authed = false;
+    $('login').classList.remove('hidden');
+    $('loginErr').textContent = 'Session expired — enter your token again.';
+    return;
+  }
+
+  if (!data.ok) {
+    endProcessing();
+    pushToast('bad', data.error || 'Something went wrong logging that.',
+      [{ label: 'Retry', action: retry }, { label: 'Dismiss', action: () => {} }]);
+    return;
+  }
+
+  endProcessing();
+  renderResult(data);
+}
+
+// ── result → toast ───────────────────────────────────────────────────
+// Every capture gets a card that stays up until it's explicitly resolved
+// — Confirm accepts it as-is, Edit swaps a flagged item to the runner-up,
+// Reject removes it. Nothing here times out on its own.
+
+function renderResult(data) {
+  if (data.daily) updateDailyBar(data.daily);
+
+  const logged = data.logged || [];
+  const flagged = logged.filter(e => e.flagged);
+  const review = data.needs_review || [];
+  const failed = data.failed || [];
+  const hasReview = review.length > 0;
+  const hasFailed = failed.length > 0;
+
+  let kind = 'ok';
+  if (!logged.length && (hasReview || hasFailed)) kind = 'bad';
+  else if (flagged.length || hasReview || hasFailed) kind = 'warn';
+
+  const actions = [{ label: 'Confirm', action: () => {}, primary: true }];
+
+  if (flagged.length === 1) {
+    // The common case — one uncertain item in the shot. Edit swaps it to
+    // the matcher's runner-up; Reject removes just that entry, leaving
+    // any clean items from the same photo intact.
+    const e = flagged[0];
+    const entryId = e.entry && e.entry.entry_id;
+    const alts = (e.match && e.match.alternatives) || [];
+    const alt = alts.find(a => a.measure_id != null); // an unloggable measure can't be swapped to
+    const grams = (e.entry && e.entry.grams) || e.guess.grams;
+    const label = (e.entry && e.entry.food_name) || e.guess.label;
+    if (entryId && alt && grams) {
+      actions.push({
+        label: 'Edit → ' + truncate(alt.name, 18),
+        action: () => swapEntry(entryId, data.date, alt, grams, data.meal, alt.name),
+      });
+    }
+    if (entryId) {
+      actions.push({ label: 'Reject', action: () => undoEntry(entryId, data.date, label) });
+    }
+  } else if (flagged.length > 1) {
+    // More than one uncertain item — picking which one to Edit needs a
+    // food-search UI this page doesn't have, so this offers the blunt
+    // option instead: drop every flagged entry, keep the clean ones.
+    actions.push({
+      label: 'Reject ' + flagged.length + ' unsure items',
+      action: () => flagged.forEach(e => {
+        const id = e.entry && e.entry.entry_id;
+        const label = (e.entry && e.entry.food_name) || e.guess.label;
+        if (id) undoEntry(id, data.date, label, /* silent */ true);
+      }),
+    });
+  }
+
+  // Structured rows instead of one long sentence — the daily-totals tail
+  // that used to be appended here is dropped too, since the navbar
+  // already shows that permanently; repeating it in every toast was just
+  // more to read for no new information.
+  const payload = logged.length
+    ? { header: 'Logged to ' + data.meal, rows: logged.slice(0, 4).map(toastRow) }
+    : shortFallbackText(review, failed);
+
+  pushToast(kind, payload, actions);
+}
+
+// Certainty score prefers the matcher's confidence in the specific food
+// it picked (what actually decided flagged-vs-clean) and falls back to
+// Gemini's own identification confidence when there's no match to score.
+function toastRow(e) {
+  const name = (e.entry && e.entry.food_name) || e.guess.label;
+  const grams = (e.entry && e.entry.grams) || e.guess.grams;
+  const best = e.match && e.match.best;
+  const conf = best && best.confidence != null ? best.confidence : e.guess.confidence;
+  const pct = conf != null ? Math.round(conf * 100) + '%' : '';
+  return { name, meta: Math.round(grams) + 'g' + (pct ? ' · ' + pct : '') };
+}
+
+function shortFallbackText(review, failed) {
+  if (review.length) return "Unsure what this is: " + review.map(e => e.guess.label).join(', ') + '.';
+  if (failed.length) return "Couldn't log: " + failed.map(e => e.guess.label).join(', ') + '.';
+  return 'Nothing logged.';
+}
+
+async function undoEntry(entryId, date, label, silent) {
+  try {
+    const r = await fetch(`/api?entry_id=${entryId}&date=${encodeURIComponent(date)}`,
+      { method: 'DELETE', credentials: 'same-origin' });
+    const j = await r.json();
+    checkDailyTotals();
+    if (!silent) {
+      pushToast(r.ok && j.ok ? 'ok' : 'bad',
+        r.ok && j.ok ? 'Removed ' + label + '.' : (j.error || 'Could not remove that.'),
+        [{ label: 'OK', action: () => {} }]);
+    }
+  } catch (e) {
+    if (!silent) {
+      pushToast('bad', 'Network error removing that.', [{ label: 'OK', action: () => {} }]);
+    }
+  }
+}
+
+async function swapEntry(entryId, date, alt, grams, meal, newLabel) {
+  try {
+    const r = await fetch('/api?action=swap', {
+      method: 'POST', credentials: 'same-origin',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        entry_id: entryId, date, meal,
+        food_id: alt.food_id, measure_id: alt.measure_id, grams,
+      }),
+    });
+    const j = await r.json();
+    checkDailyTotals();
+    pushToast(r.ok && j.ok ? 'ok' : 'bad',
+      r.ok && j.ok ? 'Swapped to ' + newLabel + '.' : (j.error || 'Could not swap that.'),
+      [{ label: 'OK', action: () => {} }]);
+  } catch (e) {
+    pushToast('bad', 'Network error swapping that.', [{ label: 'OK', action: () => {} }]);
+  }
+}
+
+function updateDailyBar(daily) {
+  if (!daily || !daily.consumed) return;
+  const c = daily.consumed;
+  const left = daily.remaining && daily.remaining.calories;
+  $('navStats').innerHTML =
+    `<span><b>${Math.round(c.calories)}</b> kcal</span>` +
+    `<span><b>${Math.round(c.protein_g)}</b>g protein</span>` +
+    (left != null ? `<span>${Math.round(left)} left</span>` : '');
+  $('navStats').classList.add('show');
+}
+
+async function checkDailyTotals() {
+  // Passive refresh — on boot, and after undo/swap (whose own responses
+  // don't carry updated totals the way a log does).
+  try {
+    const r = await fetch('/api?daily=1', { credentials: 'same-origin' });
+    const j = await r.json();
+    if (r.ok && j.ok) updateDailyBar(j.daily);
+  } catch (e) {
+    // Quiet failure — the bar just stays at whatever it last showed,
+    // which beats interrupting the camera view over a stat readout.
+  }
+}
+
+// ── toast queue ───────────────────────────────────────────────────────
+// One at a time, FIFO, and nothing here times out — a card only leaves
+// the screen when one of its own buttons is tapped. A capture fired while
+// one is already up doesn't lose it or interrupt it; the new card just
+// waits its turn in the queue.
+
+function pushToast(kind, payload, actions) {
+  // payload is either a plain string (a short one-line confirmation) or
+  // { header, rows: [{name, meta}] } (a proper log result) — advanceToast
+  // renders whichever shape it gets.
+  state.toastQueue.push({ kind, payload, actions });
+  if (!state.toastShowing) advanceToast();
+}
+
+function advanceToast() {
+  const next = state.toastQueue.shift();
+  if (!next) { state.toastShowing = false; return; }
+  state.toastShowing = true;
+
+  const el = $('toast');
+  el.className = 'glass-dark show ' + next.kind;
+
+  const msg = $('toastMsg');
+  msg.innerHTML = '';
+  const header = document.createElement('div');
+  header.id = 'toastHeader';
+  header.appendChild(Object.assign(document.createElement('span'), { id: 'toastDot' }));
+
+  if (typeof next.payload === 'string') {
+    header.classList.add('plain');
+    header.appendChild(document.createTextNode(next.payload));
+    msg.appendChild(header);
+  } else {
+    header.appendChild(document.createTextNode(next.payload.header));
+    msg.appendChild(header);
+    for (const row of next.payload.rows) {
+      const r = document.createElement('div');
+      r.className = 'toastRow';
+      const name = Object.assign(document.createElement('span'),
+        { className: 'toastRowName', textContent: row.name });
+      const meta = Object.assign(document.createElement('span'),
+        { className: 'toastRowMeta', textContent: row.meta });
+      r.append(name, meta);
+      msg.appendChild(r);
+    }
+  }
+
+  const btns = $('toastBtns');
+  btns.innerHTML = '';
+  for (const a of next.actions) {
+    const b = document.createElement('button');
+    b.textContent = a.label;
+    if (a.primary) b.className = 'primary';
+    b.onclick = () => { a.action(); resolveToast(); };
+    btns.appendChild(b);
+  }
+  requestAnimationFrame(() => el.classList.add('show'));
+}
+
+function resolveToast() {
+  $('toast').classList.remove('show');
+  setTimeout(() => { state.toastShowing = false; advanceToast(); }, 260);
+}
+
+function truncate(s, n) { return s.length > n ? s.slice(0, n - 1) + '…' : s; }
+
+boot();
+</script>
+</body>
+</html>

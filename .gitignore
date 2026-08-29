@@ -1,0 +1,21 @@
+# secrets — never commit these
+.env
+.env.*
+!.env.example
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# vercel
+.vercel/
+
+# local scratch
+*.log
+.DS_Store
+.session-cache/
+.ruff_cache/
+.env.vercel-import

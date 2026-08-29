@@ -1,0 +1,4 @@
+httpx>=0.27,<0.29
+python-dotenv>=1.0
+# zoneinfo needs an IANA database; Vercel's runtime doesn't always ship one.
+tzdata>=2024.1

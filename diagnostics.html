@@ -1,0 +1,343 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- viewport-fit=cover + safe-area insets, so the shutter never sits under
+     the home indicator once this becomes the real app. -->
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Crono">
+<meta name="theme-color" content="#0b0f14">
+<!-- standalone diagnostic page, not part of the PWA manifest/home-screen flow -->
+<title>crono-vision diagnostics</title>
+<style>
+  :root {
+    --bg: #0b0f14; --panel: #131a22; --line: #223040;
+    --text: #e6edf3; --dim: #8b9cb0;
+    --ok: #4ade80; --bad: #f87171; --warn: #fbbf24;
+    color-scheme: dark;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    padding: max(12px, env(safe-area-inset-top)) 12px max(12px, env(safe-area-inset-bottom));
+  }
+  h1 { font-size: 17px; margin: 0 0 2px; }
+  .sub { color: var(--dim); font-size: 13px; margin-bottom: 14px; }
+
+  #view {
+    position: relative; width: 100%; aspect-ratio: 3/4; background: #000;
+    border: 1px solid var(--line); border-radius: 14px; overflow: hidden;
+    display: flex; align-items: center; justify-content: center;
+  }
+  video { width: 100%; height: 100%; object-fit: cover; display: none; }
+  video.live { display: block; }
+  #viewMsg { color: var(--dim); font-size: 14px; padding: 20px; text-align: center; }
+
+  .panel {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 12px; padding: 12px 14px; margin-top: 12px;
+  }
+  .panel h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em;
+              color: var(--dim); margin: 0 0 8px; font-weight: 600; }
+  .row { display: flex; gap: 10px; padding: 5px 0; border-bottom: 1px solid #1b2530; }
+  .row:last-child { border-bottom: 0; }
+  .row .k { color: var(--dim); flex: 0 0 44%; font-size: 13px; }
+  .row .v { flex: 1; word-break: break-word; font-size: 13px;
+            font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .ok { color: var(--ok); } .bad { color: var(--bad); } .warn { color: var(--warn); }
+
+  .verdict { font-size: 15px; font-weight: 600; padding: 12px 14px; border-radius: 12px;
+             margin-top: 12px; border: 1px solid; line-height: 1.4; }
+  .verdict.ok   { background: #0f2a1a; border-color: #1f5133; color: #86efac; }
+  .verdict.bad  { background: #2a1212; border-color: #5b2020; color: #fca5a5; }
+  .verdict.warn { background: #2a2210; border-color: #5c4a17; color: #fcd34d; }
+
+  .btns { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+  button {
+    flex: 1 1 auto; min-height: 46px; padding: 0 14px; font-size: 15px; font-weight: 600;
+    color: var(--text); background: #1c2632; border: 1px solid var(--line);
+    border-radius: 11px; cursor: pointer; font-family: inherit;
+  }
+  button.primary { background: #16643a; border-color: #1f8a4f; }
+  button:active { opacity: .7; }
+
+  ol { margin: 0; padding-left: 20px; font-size: 12.5px;
+       font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--dim); }
+  ol li { padding: 3px 0; }
+  .hint { font-size: 12.5px; color: var(--dim); margin-top: 10px; line-height: 1.5; }
+</style>
+</head>
+<body>
+
+<h1>Camera smoke test</h1>
+<div class="sub">Verifying getUserMedia before any UI gets built on it.</div>
+
+<div id="view">
+  <video id="v" playsinline muted autoplay></video>
+  <div id="viewMsg">starting…</div>
+</div>
+
+<div id="verdict" class="verdict warn">Running…</div>
+
+<div class="panel">
+  <h2>Environment</h2>
+  <div id="env"></div>
+</div>
+
+<div class="panel">
+  <h2>Capture path</h2>
+  <div id="cap"><div class="row"><div class="k">status</div><div class="v">not run yet</div></div></div>
+</div>
+
+<div class="btns">
+  <button class="primary" id="bCap">Test capture</button>
+  <button id="bRe">Re-run</button>
+</div>
+
+<div class="panel">
+  <h2>Launch log <span id="launchN"></span></h2>
+  <ol id="log"></ol>
+  <div class="hint">
+    <b>The actual test:</b> add this to your Home Screen, open it, grant the camera.
+    Then fully swipe it away and reopen it 3–4 times. If later launches show
+    <b>no&nbsp;prompt</b> with a fast resolve, permission persists in standalone
+    mode and the PWA plan holds. If it re-prompts every launch, we fall back to a
+    regular Safari tab.
+  </div>
+</div>
+
+<div class="btns">
+  <button id="bCopy">Copy diagnostics</button>
+  <button id="bClear">Clear log</button>
+</div>
+
+<script>
+'use strict';
+
+const $ = (id) => document.getElementById(id);
+const LOG_KEY = 'cv-camera-test-log';
+
+// Time-to-resolve is our proxy for "did a permission prompt appear?". A
+// granted camera resolves in well under half a second; a prompt can't
+// resolve faster than a human can tap. Crude, but it answers the exact
+// question we care about and needs no Permissions API support.
+const FAST_MS = 600;
+const SLOW_MS = 1500;
+
+const state = { stream: null, mode: null, gum: null };
+
+function displayMode() {
+  if (window.navigator.standalone === true) return 'standalone';
+  for (const m of ['standalone', 'fullscreen', 'minimal-ui']) {
+    if (window.matchMedia('(display-mode: ' + m + ')').matches) return m;
+  }
+  return 'browser';
+}
+
+function rows(el, pairs) {
+  el.innerHTML = pairs.map(([k, v, cls]) =>
+    '<div class="row"><div class="k">' + k + '</div>' +
+    '<div class="v ' + (cls || '') + '">' + v + '</div></div>').join('');
+}
+
+function readLog() {
+  try { return JSON.parse(localStorage.getItem(LOG_KEY) || '[]'); }
+  catch (e) { return []; }
+}
+
+function writeLog(entries) {
+  try { localStorage.setItem(LOG_KEY, JSON.stringify(entries.slice(-12))); }
+  catch (e) { /* private mode; the live result still shows */ }
+}
+
+function renderLog() {
+  const entries = readLog();
+  $('launchN').textContent = entries.length ? '(' + entries.length + ')' : '';
+  $('log').innerHTML = entries.length
+    ? entries.map(e => {
+        const cls = e.ok ? (e.prompted === false ? 'ok' : 'warn') : 'bad';
+        const prompt = !e.ok ? e.err
+          : e.prompted === false ? 'no prompt'
+          : e.prompted === true ? 'PROMPTED' : 'unclear';
+        return '<li class="' + cls + '">' + e.t + ' · ' + e.mode + ' · ' +
+               prompt + ' · ' + e.ms + 'ms</li>';
+      }).reverse().join('')
+    : '<li>no launches recorded yet</li>';
+}
+
+async function permissionState() {
+  // Safari has historically not exposed 'camera' here. Absence is not a
+  // failure, so this is reported for information only.
+  if (!navigator.permissions || !navigator.permissions.query) return 'API absent';
+  try {
+    const s = await navigator.permissions.query({ name: 'camera' });
+    return s.state;
+  } catch (e) {
+    return 'not queryable (' + e.name + ')';
+  }
+}
+
+async function run() {
+  state.mode = displayMode();
+  const standalone = state.mode !== 'browser';
+
+  $('viewMsg').textContent = 'requesting camera…';
+  $('verdict').className = 'verdict warn';
+  $('verdict').textContent = 'Requesting camera…';
+
+  const perm = await permissionState();
+  const secure = window.isSecureContext;
+  const hasGUM = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+
+  rows($('env'), [
+    ['display mode', state.mode, standalone ? 'ok' : 'warn'],
+    ['secure context', secure ? 'yes' : 'NO — getUserMedia blocked', secure ? 'ok' : 'bad'],
+    ['mediaDevices', hasGUM ? 'available' : 'MISSING', hasGUM ? 'ok' : 'bad'],
+    ['permission state', perm],
+    ['viewport', innerWidth + '×' + innerHeight + ' @' + (devicePixelRatio || 1) + 'x'],
+    ['user agent', navigator.userAgent]
+  ]);
+
+  if (!secure || !hasGUM) {
+    fail(secure ? 'getUserMedia is unavailable in this browser.'
+               : 'Not a secure context — this must be served over HTTPS.');
+    return;
+  }
+
+  if (state.stream) { state.stream.getTracks().forEach(t => t.stop()); state.stream = null; }
+
+  const t0 = performance.now();
+  let ms, ok = false, errName = '';
+  try {
+    state.stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 } },
+      audio: false
+    });
+    ms = Math.round(performance.now() - t0);
+    ok = true;
+  } catch (e) {
+    ms = Math.round(performance.now() - t0);
+    errName = e.name + ': ' + e.message;
+  }
+
+  const prompted = !ok ? null : ms < FAST_MS ? false : ms > SLOW_MS ? true : null;
+
+  const entries = readLog();
+  entries.push({
+    t: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+    mode: state.mode, ok: ok, ms: ms, prompted: prompted, err: errName
+  });
+  writeLog(entries);
+  renderLog();
+
+  state.gum = { ok, ms, prompted, errName, perm, mode: state.mode, secure };
+
+  if (!ok) { fail(errName); return; }
+
+  const v = $('v');
+  v.srcObject = state.stream;
+  v.classList.add('live');
+  $('viewMsg').style.display = 'none';
+  await v.play().catch(() => {});
+
+  const track = state.stream.getVideoTracks()[0];
+  const s = track.getSettings ? track.getSettings() : {};
+  state.gum.track = { label: track.label, w: s.width, h: s.height, facing: s.facingMode };
+
+  const priorStandalone = readLog().filter(e => e.mode !== 'browser' && e.ok);
+  const repeats = priorStandalone.length;
+
+  if (!standalone) {
+    verdict('warn',
+      'Camera works (' + ms + 'ms), but this is a browser tab. ' +
+      'Add to Home Screen and reopen from the icon — standalone mode is the case that matters.');
+  } else if (prompted === false) {
+    verdict('ok',
+      'Camera granted with no prompt in standalone mode (' + ms + 'ms). ' +
+      (repeats >= 3
+        ? 'Permission is persisting across launches — the PWA plan holds.'
+        : 'Close and reopen ' + (4 - repeats) + ' more time(s) to confirm it sticks.'));
+  } else if (prompted === true) {
+    verdict('warn',
+      'Camera works but took ' + ms + 'ms — a prompt likely appeared. ' +
+      'If it prompts on every launch, permission is not persisting in standalone mode.');
+  } else {
+    verdict('warn', 'Camera works (' + ms + 'ms). Timing inconclusive — reopen to compare.');
+  }
+}
+
+function verdict(kind, msg) {
+  $('verdict').className = 'verdict ' + kind;
+  $('verdict').textContent = msg;
+}
+
+function fail(msg) {
+  $('viewMsg').style.display = '';
+  $('viewMsg').textContent = 'camera unavailable';
+  $('v').classList.remove('live');
+  verdict('bad', 'Camera failed — ' + msg);
+}
+
+// Exercises the exact path the real app will use: draw the frame to a
+// downscaled canvas and encode a JPEG. If this works, capture works.
+async function testCapture() {
+  const v = $('v');
+  if (!state.stream || !v.videoWidth) { alert('Camera is not live yet.'); return; }
+
+  const MAX = 1024;
+  const scale = Math.min(1, MAX / Math.max(v.videoWidth, v.videoHeight));
+  const w = Math.round(v.videoWidth * scale), h = Math.round(v.videoHeight * scale);
+
+  const t0 = performance.now();
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  c.getContext('2d').drawImage(v, 0, 0, w, h);
+
+  const blob = await new Promise(res => c.toBlob(res, 'image/jpeg', 0.85));
+  const ms = Math.round(performance.now() - t0);
+
+  if (!blob) {
+    rows($('cap'), [['status', 'toBlob returned null', 'bad']]);
+    return;
+  }
+  state.capture = { w, h, bytes: blob.size, ms };
+  rows($('cap'), [
+    ['status', 'ok', 'ok'],
+    ['source', v.videoWidth + '×' + v.videoHeight],
+    ['downscaled', w + '×' + h],
+    ['jpeg size', (blob.size / 1024).toFixed(0) + ' KB',
+      blob.size < 400 * 1024 ? 'ok' : 'warn'],
+    ['encode time', ms + ' ms']
+  ]);
+}
+
+$('bCap').onclick = testCapture;
+$('bRe').onclick = run;
+$('bClear').onclick = () => { localStorage.removeItem(LOG_KEY); renderLog(); };
+$('bCopy').onclick = async () => {
+  const blob = JSON.stringify({
+    gum: state.gum, capture: state.capture || null,
+    log: readLog(), ua: navigator.userAgent
+  }, null, 2);
+  try { await navigator.clipboard.writeText(blob); $('bCopy').textContent = 'Copied ✓'; }
+  catch (e) { prompt('Copy this:', blob); }
+  setTimeout(() => { $('bCopy').textContent = 'Copy diagnostics'; }, 1500);
+};
+
+// Re-check when returning from the background: iOS suspends camera tracks,
+// and whether they survive is itself part of what we're measuring.
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && state.stream) {
+    const t = state.stream.getVideoTracks()[0];
+    if (!t || t.readyState !== 'live') run();
+  }
+});
+
+renderLog();
+run();
+</script>
+</body>
+</html>
