@@ -60,6 +60,9 @@ as grams.
 - `confidence`: 0.0-1.0, how sure you are this is what the food is.
 - `branded`: true only if a brand name or product package is legible.
 - `notes`: anything that would change the estimate, or "" if nothing.
+- `box_2d`: a tight bounding box around this item, as [ymin, xmin, ymax, \
+xmax] with each value an integer 0-1000 normalized to the image's height \
+and width. Box the food itself, not its container or shadow.
 
 Also return `meal` — breakfast, lunch, dinner, snacks, or unknown — based on \
 what the food is, not the time of day.
@@ -82,9 +85,13 @@ _RESPONSE_SCHEMA = {
                     "confidence": {"type": "NUMBER"},
                     "branded": {"type": "BOOLEAN"},
                     "notes": {"type": "STRING"},
+                    "box_2d": {
+                        "type": "ARRAY", "items": {"type": "INTEGER"},
+                        "minItems": 4, "maxItems": 4,
+                    },
                 },
                 "required": ["label", "query", "grams", "confidence", "branded"],
-                "propertyOrdering": ["label", "query", "grams", "confidence", "branded", "notes"],
+                "propertyOrdering": ["label", "query", "grams", "confidence", "branded", "notes", "box_2d"],
             },
         },
         "meal": {"type": "STRING", "enum": ["breakfast", "lunch", "dinner", "snacks", "unknown"]},
@@ -112,6 +119,11 @@ class FoodGuess:
     confidence: float
     branded: bool = False
     notes: str = ""
+    # [ymin, xmin, ymax, xmax], each 0-1000 normalized to image height/width
+    # (Gemini's standard object-detection convention) — None when the model
+    # didn't return one. Lets the capture UI draw a marker over the actual
+    # detected region instead of a generic "processing" spinner.
+    box_2d: Optional[tuple[int, int, int, int]] = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -318,6 +330,7 @@ def _parse_response(payload: dict) -> PhotoAnalysis:
             confidence=_clamp(row.get("confidence"), 0.0, 1.0, default=0.5),
             branded=bool(row.get("branded")),
             notes=(row.get("notes") or "").strip(),
+            box_2d=_parse_box(row.get("box_2d")),
         ))
 
     return PhotoAnalysis(
@@ -337,6 +350,21 @@ def _as_bytes(image: bytes | str) -> bytes:
         return base64.b64decode(text, validate=False)
     except Exception as e:
         raise VisionError(f"Could not decode image: {e}") from e
+
+
+def _parse_box(v) -> Optional[tuple[int, int, int, int]]:
+    """[ymin, xmin, ymax, xmax], each clamped to 0-1000. A malformed or
+    missing box just means no marker for that item — never worth failing
+    the whole photo over."""
+    if not isinstance(v, (list, tuple)) or len(v) != 4:
+        return None
+    try:
+        ymin, xmin, ymax, xmax = (max(0, min(1000, int(round(float(n))))) for n in v)
+    except (TypeError, ValueError):
+        return None
+    if ymax <= ymin or xmax <= xmin:
+        return None  # degenerate box — height or width is zero or negative
+    return (ymin, xmin, ymax, xmax)
 
 
 def _positive_float(v) -> Optional[float]:

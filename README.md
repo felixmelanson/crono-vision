@@ -144,8 +144,3 @@ shared between warm invocations — which is the difference between one login a
 day and getting locked out with "Too Many Attempts."
 
 It's an undocumented API. It can change without notice.
-
-## Credit
-
-The API shape here was reverse-engineered from
-[Pop101/Cronometer-MCP](https://github.com/Pop101/Cronometer-MCP).

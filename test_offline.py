@@ -119,7 +119,8 @@ check("heic sniffed", vision.sniff_mime(b"\x00\x00\x00\x18ftypheic...."), "image
 parsed = vision._parse_response({"candidates": [{"content": {"parts": [{"text": json.dumps({
     "items": [
         {"label": "Grilled chicken", "query": "grilled chicken breast",
-         "grams": 180, "confidence": 0.9, "branded": False, "notes": ""},
+         "grams": 180, "confidence": 0.9, "branded": False, "notes": "",
+         "box_2d": [120, 300, 640, 810]},
         {"label": "Side salad", "query": "", "grams": 50, "confidence": 0.4, "branded": False},
         {"label": "zero grams", "query": "rice", "grams": 0, "confidence": 0.4, "branded": False},
         {"label": "", "query": "", "grams": 20, "confidence": 0.4, "branded": False},
@@ -131,6 +132,20 @@ check("rows without a usable amount or name are dropped", len(parsed.items), 2)
 check("query falls back to label", parsed.items[1].query, "Side salad")
 check("grams parsed", parsed.items[0].grams, 180.0)
 check("meal parsed", parsed.meal, "dinner")
+check("box_2d parsed when present", parsed.items[0].box_2d, (120, 300, 640, 810))
+check("box_2d absent when not returned", parsed.items[1].box_2d, None)
+
+for label, box, want in [
+    ("valid box", [10, 20, 500, 600], (10, 20, 500, 600)),
+    ("floats get rounded", [10.6, 20.2, 500.4, 600.9], (11, 20, 500, 601)),
+    ("out-of-range gets clamped", [-50, 20, 1500, 600], (0, 20, 1000, 600)),
+    ("wrong length", [10, 20, 500], None),
+    ("not a list", "nope", None),
+    ("zero-height box is degenerate", [100, 20, 100, 600], None),
+    ("inverted box is degenerate", [500, 20, 100, 600], None),
+    ("non-numeric entries", [10, "x", 500, 600], None),
+]:
+    check(f"_parse_box: {label}", vision._parse_box(box), want)
 
 for label, payload in [
     ("blocked prompt", {"promptFeedback": {"blockReason": "SAFETY"}}),
