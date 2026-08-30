@@ -1,8 +1,17 @@
 {
+  "_comment": [
+    "memory buys CPU as well as RAM on Vercel — they scale together — and this",
+    "function is not memory-hungry, it's latency-sensitive. 1024 roughly halves",
+    "the cold-start import time (httpx, the pipeline) that otherwise lands on",
+    "whoever presses the shutter first. Billing is GB-seconds, so a function that",
+    "costs twice as much per second and runs in half the time is close to a wash.",
+    "maxDuration is the ceiling the vision budget in vision.py is sized against —",
+    "if you raise one, raise the other."
+  ],
   "functions": {
     "api/index.py": {
       "maxDuration": 60,
-      "memory": 512
+      "memory": 1024
     }
   }
 }

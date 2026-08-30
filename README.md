@@ -124,11 +124,33 @@ grams `analyze` already settled on, so the duplicate check matches. Retrying
 the combined call re-ran vision, and a fresh estimate of 148g against a
 logged 150g slid straight past that check and logged lunch twice.
 
-Latency is mostly Gemini and always will be. The rest is kept out of the way:
-the Cronometer login runs *during* the Gemini call rather than after it, a
-batch of writes reads the day once instead of once per food, and the writes go
-out together. On a four-item plate at a 120ms round trip that's about 2.0s of
-non-Gemini overhead down to about 0.5s.
+Latency is mostly Gemini, and **which model you point it at matters more than
+everything else here combined.** Measured on one photo:
+
+| | |
+|---|---|
+| `gemini-3.5-flash-lite` (default) | ~1.8s |
+| `gemini-3.6-flash` | ~9.4s |
+| `gemini-3.7-flash` | ~6-8s, first to start returning 429 |
+
+Same items, same boxes, same portions. The big models spend those seconds
+*thinking* — they report hundreds of thinking tokens where the Lite models
+report none — and reach the same answer, because identifying an apple was
+never a reasoning problem. **Don't set `GEMINI_MODEL` to something bigger
+because it sounds better.** That one env var was worth 5-9x here, and pinning
+a thinking model is also how a capture becomes a 40-second wait: the fallback
+chain fires on a 429, and a refusal isn't fast either — an overloaded endpoint
+took a measured 17.6s just to answer 503.
+
+Hence the caps in [vision.py](vision.py): 12s per attempt, 30s across all of
+them, fallbacks ordered fastest-first. A fallback fires when the person has
+*already* been waiting, which is the worst possible moment to reach for the
+slowest model in the list.
+
+The rest is kept out of the way: the Cronometer login runs *during* the Gemini
+call rather than after it, a batch of writes reads the day once instead of once
+per food, and the writes go out together. On a four-item plate at a 120ms round
+trip that's about 2.0s of non-Gemini overhead down to about 0.5s.
 
 Nothing in the browser runs without a deadline (`ANALYZE_TIMEOUT_MS` and
 friends in [index.html](index.html)), and Gemini's model-fallback chain has a

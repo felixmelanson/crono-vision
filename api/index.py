@@ -53,7 +53,7 @@ from urllib.parse import parse_qs, urlparse
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from pipeline import analyze, commit, log_photo  # noqa: E402
-from vision import VisionError  # noqa: E402
+from vision import VisionError, active_model, fallback_models  # noqa: E402
 from cronometer_client import CronometerAuthError, CronometerClient, CronometerError  # noqa: E402
 from webauth import is_authorized  # noqa: E402
 
@@ -96,6 +96,9 @@ class handler(BaseHTTPRequestHandler):
             if params.get("daily") and is_authorized(self.headers):
                 self._handle_daily(params.get("date"))
                 return
+            if params.get("warm") and is_authorized(self.headers):
+                self._handle_warm()
+                return
         except Exception:  # noqa: BLE001
             traceback.print_exc()
             self._json(500, {"ok": False, "error": "Internal error. Check the function logs."})
@@ -111,8 +114,45 @@ class handler(BaseHTTPRequestHandler):
                 "gemini": bool(os.environ.get("GEMINI_API_KEY")),
                 "auth_token": bool(os.environ.get("CRONO_VISION_TOKEN")),
                 "timezone": os.environ.get("CRONOMETER_TIMEZONE") or "(unset — will use UTC)",
+                # Which model is actually live, and whether something is
+                # overriding the default. A model name is not a secret, and
+                # not being able to see this one from outside is how a
+                # deployment sat pinned to a model that answered every
+                # request with 429 — each capture quietly walking the whole
+                # fallback chain instead — while the code said otherwise.
+                "model": active_model(),
+                "model_pinned_by_env": bool(os.environ.get("GEMINI_MODEL")),
+                "fallbacks": fallback_models(),
             },
         })
+
+    def _handle_warm(self) -> None:
+        """GET /api?warm=1 — pay the startup costs before the shutter does.
+
+        Two of them, and both land on whoever captures first. Vercel has to
+        cold-start the function: boot Python, import httpx and this
+        pipeline. And the Cronometer session cache in /tmp is empty on a
+        fresh instance, so the first real request also pays a login round
+        trip. Neither is work the photo needs — they're just sitting in
+        front of it.
+
+        The page calls this when the camera comes up and when it returns to
+        the foreground, so by the time anyone presses the shutter the
+        instance is warm and the session key is already on disk. It is
+        deliberately the cheapest possible authenticated call: log in,
+        answer, touch nothing else.
+        """
+        client = CronometerClient()
+        try:
+            client.ensure_auth()
+        except (CronometerAuthError, CronometerError) as e:
+            # A warm-up is an optimization, not a promise. Report it and
+            # let the real request deal with it properly.
+            self._json(200, {"ok": False, "warm": False, "error": str(e)})
+            return
+        finally:
+            client.close()
+        self._json(200, {"ok": True, "warm": True})
 
     def _handle_daily(self, date: str = None) -> None:
         client = CronometerClient()

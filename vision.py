@@ -26,19 +26,44 @@ import httpx
 log = logging.getLogger("crono_vision.vision")
 
 API_ROOT = "https://generativelanguage.googleapis.com/v1beta/models"
-# Current Flash model as of Aug 2026.
-DEFAULT_MODEL = "gemini-3.7-flash"
+
+# A Lite model, deliberately, and this is the single biggest lever on how
+# long someone stands there holding their phone. Measured on the same
+# photo, Aug 2026:
+#
+#   gemini-3.5-flash-lite    ~1.8s
+#   gemini-3.6-flash         ~9.4s
+#   gemini-3.7-flash         ~6-8s, and the first to start returning 429
+#
+# Same four items, same bounding boxes, same portion estimates — the big
+# models spend the extra seconds *thinking* (they report hundreds of
+# thinking tokens; the Lite models report none) and arrive at the same
+# answer. Identifying an apple is not a reasoning problem. Naming what's
+# on a plate is the one thing every one of these models is already good
+# at, so buying more capability here buys nothing but latency.
+#
+# Override with GEMINI_MODEL if a plate ever genuinely stumps this one.
+DEFAULT_MODEL = "gemini-3.5-flash-lite"
 
 # Tried in order after the primary model, on either a capacity failure (the
 # model is overloaded or rate-limited) or a 404 (the model id was
 # deprecated or renamed out from under us — this list has already gone
 # stale once, from a pinned gemini-2.5-flash Google cut off from new
-# callers). gemini-flash-latest is deliberately last and deliberately an
-# alias rather than a version: it's Google's own pointer to whatever Flash
-# model is current, so it can't go stale the way a pinned name can.
+# callers). gemini-flash-lite-latest is deliberately an alias rather than a
+# version: it's Google's own pointer to whatever Lite model is current, so
+# it can't go stale the way a pinned name can.
+#
+# Ordered fastest-first, which is the opposite of the obvious instinct. A
+# fallback fires when something is already wrong, i.e. exactly when the
+# person has already been waiting — that is the worst moment to reach for
+# the slowest model in the list. gemini-3.6-flash is last because it's the
+# only genuinely different one, worth ~9s only when everything quick has
+# already refused.
+#
 # Override with GEMINI_FALLBACK_MODELS="model-a,model-b" (empty string
 # disables fallback entirely).
-DEFAULT_FALLBACK_MODELS = ("gemini-3.6-flash", "gemini-3.5-flash-lite", "gemini-flash-latest")
+DEFAULT_FALLBACK_MODELS = ("gemini-3.1-flash-lite", "gemini-flash-lite-latest",
+                           "gemini-3.6-flash")
 
 PROMPT = """You are a nutrition-logging assistant. Identify every distinct food \
 and drink in this photo and estimate how much of each is present.
@@ -60,13 +85,16 @@ food only, not the plate, packaging, or hand. For drinks, use millilitres \
 as grams.
 - `confidence`: 0.0-1.0, how sure you are this is what the food is.
 - `branded`: true only if a brand name or product package is legible.
-- `notes`: anything that would change the estimate, or "" if nothing.
 - `box_2d`: a tight bounding box around this item, as [ymin, xmin, ymax, \
 xmax] with each value an integer 0-1000 normalized to the image's height \
 and width. Box the food itself, not its container or shadow.
 
 Also return `meal` — breakfast, lunch, dinner, snacks, or unknown — based on \
 what the food is, not the time of day.
+
+Return only these fields. Do not explain, caption, or add commentary: every \
+token you spend on prose is a second the person holding the phone spends \
+staring at a frozen frame.
 
 Combine things that would be logged as one food (a sandwich's bread, a salad's \
 dressing) only when they cannot be separated visually. Skip garnishes under \
@@ -85,21 +113,19 @@ _RESPONSE_SCHEMA = {
                     "grams": {"type": "NUMBER"},
                     "confidence": {"type": "NUMBER"},
                     "branded": {"type": "BOOLEAN"},
-                    "notes": {"type": "STRING"},
                     "box_2d": {
                         "type": "ARRAY", "items": {"type": "INTEGER"},
                         "minItems": 4, "maxItems": 4,
                     },
                 },
                 "required": ["label", "query", "grams", "confidence", "branded"],
-                "propertyOrdering": ["label", "query", "grams", "confidence", "branded", "notes", "box_2d"],
+                "propertyOrdering": ["label", "query", "grams", "confidence", "branded", "box_2d"],
             },
         },
         "meal": {"type": "STRING", "enum": ["breakfast", "lunch", "dinner", "snacks", "unknown"]},
-        "notes": {"type": "STRING"},
     },
     "required": ["items"],
-    "propertyOrdering": ["items", "meal", "notes"],
+    "propertyOrdering": ["items", "meal"],
 }
 
 
@@ -119,6 +145,9 @@ class FoodGuess:
     grams: float
     confidence: float
     branded: bool = False
+    # No longer requested — see the schema. Kept as a tolerated field so a
+    # model that volunteers one anyway still parses, and so the response
+    # shape doesn't change for anything already reading it.
     notes: str = ""
     # [ymin, xmin, ymax, xmax], each 0-1000 normalized to image height/width
     # (Gemini's standard object-detection convention) — None when the model
@@ -165,6 +194,19 @@ def sniff_mime(data: bytes) -> str:
     return "image/jpeg"
 
 
+def active_model() -> str:
+    """The model a call would actually use right now — the env override if
+    one is set, otherwise the default. Public because the health check
+    reports it: a pinned model that silently outranks DEFAULT_MODEL is
+    exactly the kind of thing you want visible from outside the process."""
+    return os.environ.get("GEMINI_MODEL") or DEFAULT_MODEL
+
+
+def fallback_models() -> list[str]:
+    """The chain tried after `active_model`, in order."""
+    return [m for m in _fallback_models() if m != active_model()]
+
+
 def _fallback_models() -> list[str]:
     raw = os.environ.get("GEMINI_FALLBACK_MODELS")
     if raw is not None:  # explicitly set — including "" to disable fallback
@@ -179,8 +221,8 @@ def analyze_photo(
     model: Optional[str] = None,
     hint: Optional[str] = None,
     mime_type: Optional[str] = None,
-    timeout: float = 20.0,
-    budget: float = 40.0,
+    timeout: float = 12.0,
+    budget: float = 30.0,
     http: Optional[httpx.Client] = None,
 ) -> PhotoAnalysis:
     """Identify foods in a photo.
@@ -201,6 +243,12 @@ def analyze_photo(
     at 60s, so a slow — not failing — Gemini used to end as a 504 with a
     non-JSON body, after the diary writes had already happened. Falling
     back is only worth doing while there's time left to serve the answer.
+
+    The per-attempt cap is tight on purpose. A refusal is not always fast:
+    an overloaded endpoint took a measured 17.6s to answer 503, which is
+    most of a budget spent learning nothing. The primary model answers in
+    about two seconds, so anything still silent at twelve is not thinking
+    hard — it's gone, and the next model is the better bet.
     """
     key = api_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
     if not key:
@@ -210,7 +258,7 @@ def analyze_photo(
     if not raw:
         raise VisionError("Empty image")
 
-    primary = model or os.environ.get("GEMINI_MODEL") or DEFAULT_MODEL
+    primary = model or active_model()
     candidates = [primary] + [m for m in _fallback_models() if m != primary]
 
     client = http or httpx.Client(timeout=timeout)
@@ -278,9 +326,21 @@ def _call_model(
         },
     }
 
-    # Thinking helps portion estimates but costs seconds, and a Shortcut is
-    # waiting on this. Default off; raise GEMINI_THINKING_BUDGET if you'd
-    # rather have the accuracy.
+    # Thinking helps portion estimates but costs seconds, and a phone is
+    # waiting on this.
+    #
+    # Sending nothing here does NOT mean thinking is off — that was the
+    # assumption, and it was wrong. The Gemini 3.x thinking models default
+    # to *dynamic* thinking, and they bill for it: gemini-3.7-flash reports
+    # ~250 thinking tokens on a photo of a single apple, gemini-3.6-flash
+    # ~620, and those tokens are most of why they take five to nine seconds
+    # to say "apple". The Lite models this now defaults to report none at
+    # all, which is the real reason they're fast.
+    #
+    # Nor can it simply be turned off: thinkingBudget=0 is rejected with a
+    # 400 by gemini-3.6-flash and the Lite models alike. Picking a model
+    # that doesn't think is the lever that actually exists; this knob only
+    # goes the other way, for when you want the accuracy back.
     budget = os.environ.get("GEMINI_THINKING_BUDGET")
     if budget is not None:
         try:

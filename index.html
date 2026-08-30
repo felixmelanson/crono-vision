@@ -89,6 +89,27 @@
     position: absolute; inset: 0; width: 100%; height: 100%;
     object-fit: cover; background: #000;
   }
+  /* The preview is scenery, not a player. Safari decides on its own that a
+     video filling the viewport is "main content" and paints its overlay
+     playback control in the middle of it — over a camera feed that reads
+     as a pause button sitting in the middle of the shot. There is nothing
+     to pause: pausing the preview freezes the frame capture() reads from,
+     so the control isn't merely redundant, it breaks the shutter. Kill the
+     control and take the element out of the hit-testing path entirely —
+     nothing here is meant to be tappable, the shutter is its own button. */
+  video {
+    pointer-events: none;
+  }
+  video::-webkit-media-controls,
+  video::-webkit-media-controls-enclosure,
+  video::-webkit-media-controls-panel,
+  video::-webkit-media-controls-play-button,
+  video::-webkit-media-controls-overlay-play-button,
+  video::-webkit-media-controls-start-playback-button {
+    display: none !important;
+    -webkit-appearance: none;
+    opacity: 0;
+  }
   #freeze { display: none; }
   #camMsg {
     position: absolute; inset: 0; display: none; align-items: center;
@@ -393,7 +414,8 @@
 <body>
 
 <div id="camWrap">
-  <video id="v" playsinline muted autoplay></video>
+  <video id="v" playsinline muted autoplay disablepictureinpicture
+         disableremoteplayback controlslist="nodownload noplaybackrate noremoteplayback"></video>
   <canvas id="freeze"></canvas>
   <div id="detectLayer"></div>
   <div id="loadingOverlay">
@@ -570,11 +592,26 @@ async function login(token) {
   return { ok: r.ok && j.authed, error: j.error };
 }
 
+// Cold start + a Cronometer login, paid up front instead of by whoever
+// presses the shutter first. Fire-and-forget: if it fails, the real
+// request will surface the problem properly. Throttled, because the point
+// is to be warm at capture time, not to chat with the server.
+let lastWarm = 0;
+function warmUp() {
+  if (!state.authed) return;
+  const now = Date.now();
+  if (now - lastWarm < 60000) return;
+  lastWarm = now;
+  fetchWithTimeout('/api?warm=1', { credentials: 'same-origin' }, 10000)
+    .catch(() => { lastWarm = 0; });  // let the next trigger try again
+}
+
 async function boot() {
   state.authed = await checkAuth();
   if (state.authed) {
     $('login').classList.add('hidden');
     startCamera();
+    warmUp();
   }
   // else: login screen (visible by default) stays up.
 }
@@ -587,8 +624,10 @@ $('loginBtn').onclick = async () => {
   const res = await login(token);
   $('loginBtn').disabled = false;
   if (res.ok) {
+    state.authed = true;
     $('login').classList.add('hidden');
     startCamera();
+    warmUp();
   } else {
     $('loginErr').textContent = res.error || 'Wrong token — try again.';
     $('loginInput').select();
@@ -817,6 +856,10 @@ function finishProcessingWithMarkers(guesses) {
 // the photo is still in the closure, so it costs one tap to retry.
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState !== 'visible') return;
+  // Coming back to the app is the best available signal that a photo is
+  // about to be taken, and the instance has probably gone cold in the
+  // meantime.
+  warmUp();
   if (!state.processing || state.inFlight > 0) return;
   endProcessing();
   pushToast('warn', 'That upload was interrupted. Nothing was logged.',

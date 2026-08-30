@@ -12,6 +12,7 @@ this suite is safe to run in CI and safe to run repeatedly.
 import json
 import os
 import sys
+import time
 
 os.environ.setdefault("CRONOMETER_EMAIL", "test@example.com")
 os.environ.setdefault("CRONOMETER_PASSWORD", "hunter2")
@@ -314,6 +315,31 @@ try:
 except vision.VisionError as e:
     check("every model overloaded still raises", isinstance(e, vision.VisionOverloaded), True)
     check("tried every candidate before giving up", calls_seen, FULL_CHAIN)
+
+# The fallback chain is what turned a slow Gemini into a 40-second wait: a
+# refusal is not always quick (an overloaded endpoint took a measured 17.6s
+# to answer 503), so four attempts can outlast the function itself. The
+# budget is the backstop — once it's gone, stop trying and report.
+calls_seen.clear()
+
+
+def slow_503(request: httpx.Request) -> httpx.Response:
+    calls_seen.append(request.url.path.split("/")[-1].split(":")[0])
+    time.sleep(0.25)  # every model is slow to refuse
+    return httpx.Response(503, json={"error": {"message": "overloaded"}})
+
+
+started = time.monotonic()
+try:
+    vision.analyze_photo(b"\xff\xd8\xff", api_key="k", budget=0.4, timeout=5.0,
+                         http=httpx.Client(transport=httpx.MockTransport(slow_503)))
+    check("the budget stops the chain", "no raise", "VisionOverloaded")
+except vision.VisionOverloaded:
+    elapsed = time.monotonic() - started
+    check("the budget stops the chain before every model is tried",
+          len(calls_seen) < len(FULL_CHAIN), True)
+    check("and gives up in roughly the budget, not the whole chain",
+          elapsed < 1.0, True)
 
 os.environ["GEMINI_FALLBACK_MODELS"] = "gemini-custom-a,gemini-custom-b"
 calls_seen.clear()

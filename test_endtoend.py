@@ -23,7 +23,8 @@ import httpx
 
 import pipeline
 import vision
-from cronometer_client import CronometerClient, group_name, resolve_diary_group
+from cronometer_client import (CronometerAuthError, CronometerClient, group_name,
+                               resolve_diary_group)
 
 _failures = []
 
@@ -423,6 +424,32 @@ check("unauthenticated daily request falls back to the health check",
 status, out = call("GET", "/api", {})
 check("plain GET with no daily param is still just the health check",
       "daily" not in out, True)
+
+# ── warm-up (/api?warm=1) ────────────────────────────────────────────
+# Fired when the camera comes up, so the cold start and the Cronometer
+# login are paid before someone presses the shutter rather than by them.
+print("\nwarm-up")
+status, out = call("GET", "/api?warm=1", AUTH)
+check("warm-up succeeds", (status, out.get("warm")), (200, True))
+check("warm-up says nothing about the diary", "daily" in out, False)
+
+status, out = call("GET", "/api?warm=1", {"authorization": "Bearer wrong"})
+check("unauthenticated warm-up falls back to the health check",
+      out.get("service"), "crono-vision")
+
+
+def failing_login(*a, **kw):
+    c = fresh_client()
+    c.login = lambda: (_ for _ in ()).throw(CronometerAuthError("nope"))
+    c.ensure_auth = c.login
+    return c
+
+
+api_log.CronometerClient = failing_login
+status, out = call("GET", "/api?warm=1", AUTH)
+check("a failed warm-up is reported, not fatal — it's only an optimization",
+      (status, out.get("warm")), (200, False))
+api_log.CronometerClient = lambda *a, **kw: fresh_client()
 
 # ── two-phase: analyze writes nothing, commit writes ─────────────────
 # The camera page takes these as separate requests so it can draw its
