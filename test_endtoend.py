@@ -47,7 +47,7 @@ GEMINI_REPLY = {
         {"label": "Mystery sauce", "query": "unidentifiable sauce",
          "grams": 30, "confidence": 0.2, "branded": False, "notes": "too dark to tell"},
     ],
-    "meal": "dinner",
+    "course": "meal",
     "notes": "",
 }
 gemini_requests = []
@@ -169,7 +169,7 @@ print(f"       summary: {res['summary']}")
 
 # ── nothing in the photo ────────────────────────────────────────────
 print("\nempty photo")
-GEMINI_REPLY_EMPTY = {"items": [], "meal": "unknown", "notes": "no food visible"}
+GEMINI_REPLY_EMPTY = {"items": [], "course": "unknown", "notes": "no food visible"}
 pipeline.vision.analyze_photo = lambda image, **kw: vision._parse_response(
     {"candidates": [{"content": {"parts": [{"text": json.dumps(GEMINI_REPLY_EMPTY)}]}}]})
 added.clear()
@@ -591,6 +591,41 @@ again = client.add_entry(food_id=logged_entry["food_id"],
 check("a skipped duplicate still reports the food it points at",
       (again["skipped"], again["food_id"], again["measure_id"]),
       (True, logged_entry["food_id"], logged_entry["measure_id"]))
+
+# ── snack demotion, through the whole pipeline ───────────────────────
+# The clock owns breakfast/lunch/dinner; vision only ever answers "is this
+# a snack", and the one move it can make is pulling something out of a
+# meal slot into snacks. A bowl of strawberries at noon is the case.
+print("\nsnack demotion")
+SNACK_REPLY = {
+    "items": [{"label": "Strawberries", "query": "grilled chicken breast",
+               "grams": 120, "confidence": 0.95, "branded": False}],
+    "course": "snack", "notes": "",
+}
+pipeline.vision.analyze_photo = lambda image, **kw: vision._parse_response(
+    {"candidates": [{"content": {"parts": [{"text": json.dumps(SNACK_REPLY)}]}}]})
+
+added.clear()
+res = pipeline.log_photo(b"\xff\xd8\xff", date="2026-08-28", client=fresh_client())
+check("a snack lands in snacks whatever the clock said", res["meal"], "snacks")
+check("and the serving is written to that group",
+      added[0]["diaryGroup"], resolve_diary_group("snacks"))
+check("the course is reported back", res["vision"]["course"], "snack")
+
+res = pipeline.log_photo(b"\xff\xd8\xff", date="2026-08-28", meal="lunch",
+                         client=fresh_client())
+check("an explicit meal still overrides the snack verdict", res["meal"], "lunch")
+
+# A stale model answering with an old-style time slot must not be able to
+# pick the slot — that was the original bug, and the parser drops it.
+STALE = {**SNACK_REPLY, "course": "lunch"}
+pipeline.vision.analyze_photo = lambda image, **kw: vision._parse_response(
+    {"candidates": [{"content": {"parts": [{"text": json.dumps(STALE)}]}}]})
+res = pipeline.log_photo(b"\xff\xd8\xff", date="2026-08-28", client=fresh_client())
+check("a model that answers 'lunch' is ignored, not obeyed",
+      (res["vision"]["course"], res["meal"]), ("unknown", now_meal))
+
+pipeline.vision.analyze_photo = fake_analyze
 
 print()
 if _failures:

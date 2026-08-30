@@ -42,7 +42,8 @@ from typing import Optional
 
 import matcher
 import vision
-from cronometer_client import CronometerClient, CronometerError, normalize_date, resolve_diary_group, group_name
+from cronometer_client import (CronometerClient, CronometerError, DIARY_GROUPS,
+                               normalize_date, resolve_diary_group, group_name)
 
 log = logging.getLogger("crono_vision")
 
@@ -75,20 +76,10 @@ def analyze(
     """
     day = normalize_date(date)
 
-    # Meal precedence: caller's explicit choice, else the clock. "auto" is
-    # a sentinel for "no real preference", same as not passing meal at all.
-    #
-    # This deliberately ignores what Gemini thinks the food looks like
-    # (analysis.meal) even though it's right there — that was tried, and
-    # produced exactly the surprise it sounds like: a steak dinner
-    # photographed at 12:27am logged as "lunch" because the plate read as
-    # a lunch-type meal, while a can of soda at the same hour logged as a
-    # snack. Every other diet tracker buckets by time slot, not food
-    # content, and that's the less surprising default — "late dinner"
-    # beats "lunch at 1am" even when the plate genuinely looks like lunch.
+    # "auto" is a sentinel for "no real preference", same as not passing
+    # meal at all. The clock-and-food decision happens after the photo comes
+    # back, in _resolve_meal.
     explicit_meal = meal if meal and meal.strip().lower() != "auto" else None
-    group_id = resolve_diary_group(explicit_meal or "auto")
-    meal_label = group_name(group_id)
 
     own_client = client is None
     client = client or CronometerClient()
@@ -121,6 +112,9 @@ def analyze(
     finally:
         if own_client:
             client.close()
+
+    group_id = _resolve_meal(explicit_meal, analysis)
+    meal_label = group_name(group_id)
 
     pending, review, failed = [], [], []
     for guess, result in zip(analysis.items, matches):
@@ -168,7 +162,7 @@ def analyze(
     return {
         "date": day,
         "meal": meal_label,
-        "vision": {"meal_guess": analysis.meal, "notes": analysis.notes},
+        "vision": {"course": analysis.course, "notes": analysis.notes},
         "pending": pending,
         "needs_review": review,
         "failed": failed,
@@ -341,6 +335,40 @@ def log_photo(
     }
 
 
+def _resolve_meal(explicit_meal: Optional[str], analysis) -> int:
+    """Which diary section this photo belongs in.
+
+    Three layers, in strict order of authority:
+
+      1. What the caller asked for. Nothing overrides an explicit meal.
+      2. The clock. It alone decides breakfast vs lunch vs dinner, using
+         the windows in cronometer_client (configurable per deployment).
+      3. What the food is — but only to answer one question: is this a
+         snack? If so it moves to snacks, wherever the clock had it.
+
+    Layer 3 is one-directional on purpose. Letting the model pick the slot
+    outright is what produced a steak photographed at 12:27am filed under
+    "lunch", because the plate read as a lunch-type meal. It has no way to
+    say "lunch" now — the only move it can make is demoting a bowl of
+    strawberries at noon out of lunch and into snacks, which is the case
+    the clock genuinely gets wrong.
+
+    It never promotes the other way either. A steak at 3am stays in snacks
+    rather than becoming "dinner", because at that hour the slot really is
+    the honest answer and the alternative is the old bug wearing a hat.
+    """
+    if explicit_meal:
+        return resolve_diary_group(explicit_meal)
+
+    group_id = resolve_diary_group("auto")
+    snacks = DIARY_GROUPS["snacks"]
+    if analysis is not None and analysis.is_snack and group_id != snacks:
+        log.debug("clock said %s, vision says snack — filing under snacks",
+                  group_name(group_id))
+        return snacks
+    return group_id
+
+
 def _match_one(client: CronometerClient, guess: vision.FoodGuess):
     """Search + rank one guess. Exceptions come back as values, not raises,
     so one bad food doesn't sink the whole photo."""
@@ -356,7 +384,7 @@ def _empty_result(day: str, meal: Optional[str], analysis, summary: str) -> dict
         "date": day,
         "meal": group_name(resolve_diary_group(meal or "auto")),
         "dry_run": False,
-        "vision": {"meal_guess": analysis.meal, "notes": analysis.notes},
+        "vision": {"course": analysis.course, "notes": analysis.notes},
         "logged": [], "needs_review": [], "failed": [],
         "daily": None,
         "summary": summary,

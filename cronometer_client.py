@@ -117,6 +117,56 @@ def normalize_date(value: Optional[str]) -> str:
         raise ValueError(f"Bad date {value!r}; want YYYY-MM-DD, 'today' or 'yesterday'") from e
 
 
+# Each entry is the hour a meal window *opens*; it runs until the next one.
+# The last window wraps past midnight, which is the point of starting the day
+# at 04:00 rather than 00:00 — a 1am plate is the tail of last night, not
+# tomorrow's breakfast, and the old table (breakfast from midnight) filed
+# every late-night snack under breakfast.
+#
+# People eat on different schedules, so this is overridable per deployment:
+#   CRONO_MEAL_WINDOWS=breakfast:04:00,lunch:10:30,dinner:15:00,snacks:21:00
+DEFAULT_MEAL_WINDOWS = (
+    ("breakfast", 4.0),
+    ("lunch", 10.5),
+    ("dinner", 15.0),
+    ("snacks", 21.0),
+)
+
+
+def meal_windows() -> tuple[tuple[str, float], ...]:
+    """The configured meal windows, or the defaults.
+
+    A malformed CRONO_MEAL_WINDOWS falls back rather than raising. A typo in
+    an env var should not stop you logging your dinner; it should log to a
+    sensible slot and say so in the logs.
+    """
+    raw = os.environ.get("CRONO_MEAL_WINDOWS")
+    if not raw or not raw.strip():
+        return DEFAULT_MEAL_WINDOWS
+    try:
+        windows = []
+        for chunk in raw.split(","):
+            name, _, clock = chunk.strip().partition(":")
+            name = name.strip().lower()
+            if name not in DIARY_GROUPS:
+                raise ValueError(f"unknown meal {name!r}")
+            hh, _, mm = clock.strip().partition(":")
+            hour = int(hh) + int(mm or 0) / 60
+            if not 0 <= hour < 24:
+                raise ValueError(f"{name}: {clock!r} is not a time of day")
+            windows.append((name, hour))
+        if not windows:
+            raise ValueError("no windows given")
+        names = [n for n, _ in windows]
+        if len(set(names)) != len(names):
+            raise ValueError(f"a meal appears twice: {names}")
+        windows.sort(key=lambda w: w[1])
+        return tuple(windows)
+    except (ValueError, TypeError) as e:
+        log.warning("CRONO_MEAL_WINDOWS=%r is malformed (%s); using defaults", raw, e)
+        return DEFAULT_MEAL_WINDOWS
+
+
 def resolve_diary_group(group: Optional[str], when: Optional[datetime] = None) -> int:
     """Map a meal name to Cronometer's group id.
 
@@ -132,13 +182,14 @@ def resolve_diary_group(group: Optional[str], when: Optional[datetime] = None) -
     if key in ("auto", ""):
         now = when or datetime.now(local_timezone())
         hour = now.hour + now.minute / 60
-        if hour < 10.5:
-            return DIARY_GROUPS["breakfast"]
-        if hour < 15:
-            return DIARY_GROUPS["lunch"]
-        if hour < 21:
-            return DIARY_GROUPS["dinner"]
-        return DIARY_GROUPS["snacks"]
+        windows = meal_windows()
+        # Before the first window opens we're in the small hours, which
+        # belong to the window that wraps midnight — the last one.
+        chosen = windows[-1][0]
+        for name, start in windows:
+            if hour >= start:
+                chosen = name
+        return DIARY_GROUPS[chosen]
     raise ValueError(f"Unknown diary_group {group!r}; want auto/{'/'.join(DIARY_GROUPS)}")
 
 

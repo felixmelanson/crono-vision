@@ -89,8 +89,10 @@ as grams.
 xmax] with each value an integer 0-1000 normalized to the image's height \
 and width. Box the food itself, not its container or shadow.
 
-Also return `meal` — breakfast, lunch, dinner, snacks, or unknown — based on \
-what the food is, not the time of day.
+Also return `course`: "meal" if this is a proper meal, "snack" if it's a \
+light bite — a piece of fruit, a handful of nuts, a single drink, a small \
+bowl of one thing. Judge the food and the amount, not the hour. Say \
+"unknown" if it's genuinely borderline.
 
 Return only these fields. Do not explain, caption, or add commentary: every \
 token you spend on prose is a second the person holding the phone spends \
@@ -122,10 +124,16 @@ _RESPONSE_SCHEMA = {
                 "propertyOrdering": ["label", "query", "grams", "confidence", "branded", "box_2d"],
             },
         },
-        "meal": {"type": "STRING", "enum": ["breakfast", "lunch", "dinner", "snacks", "unknown"]},
+        # Deliberately NOT breakfast/lunch/dinner. Naming the time slot is
+        # the authority this model had once and misused: a steak
+        # photographed at 12:27am came back "lunch" because the plate looked
+        # like lunch. It has no vocabulary for a slot now, so the clock owns
+        # that and this only answers meal-or-snack — a judgment about the
+        # food itself, which is the part it's actually good at.
+        "course": {"type": "STRING", "enum": ["meal", "snack", "unknown"]},
     },
     "required": ["items"],
-    "propertyOrdering": ["items", "meal"],
+    "propertyOrdering": ["items", "course"],
 }
 
 
@@ -162,13 +170,18 @@ class FoodGuess:
 @dataclass
 class PhotoAnalysis:
     items: list[FoodGuess] = field(default_factory=list)
-    meal: str = "unknown"
+    # "meal" | "snack" | "unknown" — not a time slot. See the schema.
+    course: str = "unknown"
     notes: str = ""
+
+    @property
+    def is_snack(self) -> bool:
+        return self.course == "snack"
 
     def to_dict(self) -> dict:
         return {
             "items": [i.to_dict() for i in self.items],
-            "meal": self.meal,
+            "course": self.course,
             "notes": self.notes,
         }
 
@@ -412,9 +425,16 @@ def _parse_response(payload: dict) -> PhotoAnalysis:
             box_2d=_parse_box(row.get("box_2d")),
         ))
 
+    # Anything that isn't one of the two answers we asked for is "unknown",
+    # which the caller treats as "no opinion" — including a stale model
+    # replying with an old-style time slot like "lunch".
+    course = (data.get("course") or "unknown").strip().lower()
+    if course not in ("meal", "snack"):
+        course = "unknown"
+
     return PhotoAnalysis(
         items=items,
-        meal=(data.get("meal") or "unknown").strip().lower(),
+        course=course,
         notes=(data.get("notes") or "").strip(),
     )
 

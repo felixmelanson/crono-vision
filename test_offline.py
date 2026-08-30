@@ -23,8 +23,8 @@ import httpx
 import matcher
 import vision
 from cronometer_client import (
-    CronometerClient, FoodHit, DIARY_GROUPS,
-    normalize_date, resolve_diary_group, today, _extract_entry_id,
+    CronometerClient, FoodHit, DIARY_GROUPS, DEFAULT_MEAL_WINDOWS, group_name,
+    meal_windows, normalize_date, resolve_diary_group, today, _extract_entry_id,
 )
 
 _failures = []
@@ -62,6 +62,105 @@ check("auto @ 12:30 -> lunch", resolve_diary_group("auto", datetime(2026, 8, 28,
 check("auto @ 19:00 -> dinner", resolve_diary_group("auto", datetime(2026, 8, 28, 19, 0)), 3)
 check("auto @ 22:30 -> snacks", resolve_diary_group("auto", datetime(2026, 8, 28, 22, 30)), 4)
 check("None -> auto", resolve_diary_group(None, datetime(2026, 8, 28, 12, 0)), 2)
+
+# The day starts at 04:00, not midnight. Before this, every late-night plate
+# landed in breakfast — 1am is the tail of last night, not tomorrow morning.
+check("auto @ 01:00 -> snacks, not tomorrow's breakfast",
+      resolve_diary_group("auto", datetime(2026, 8, 28, 1, 0)), 4)
+check("auto @ 03:59 -> still snacks",
+      resolve_diary_group("auto", datetime(2026, 8, 28, 3, 59)), 4)
+check("auto @ 04:00 -> breakfast opens",
+      resolve_diary_group("auto", datetime(2026, 8, 28, 4, 0)), 1)
+for label, (h, m), want in [
+    ("10:29 breakfast", (10, 29), 1), ("10:30 lunch", (10, 30), 2),
+    ("14:59 lunch", (14, 59), 2), ("15:00 dinner", (15, 0), 3),
+    ("20:59 dinner", (20, 59), 3), ("21:00 snacks", (21, 0), 4),
+]:
+    check(f"boundary {label}", resolve_diary_group("auto", datetime(2026, 8, 28, h, m)), want)
+
+# ── configurable meal windows ───────────────────────────────────────
+print("\nmeal windows")
+check("defaults when unset", meal_windows(), DEFAULT_MEAL_WINDOWS)
+
+os.environ["CRONO_MEAL_WINDOWS"] = "breakfast:07:00,lunch:12:00,dinner:18:00,snacks:22:00"
+check("parsed from env", meal_windows(),
+      (("breakfast", 7.0), ("lunch", 12.0), ("dinner", 18.0), ("snacks", 22.0)))
+check("a late riser's 08:00 is breakfast",
+      resolve_diary_group("auto", datetime(2026, 8, 28, 8, 0)), 1)
+check("their 11:00 is still breakfast, not lunch",
+      resolve_diary_group("auto", datetime(2026, 8, 28, 11, 0)), 1)
+check("their 23:00 is snacks",
+      resolve_diary_group("auto", datetime(2026, 8, 28, 23, 0)), 4)
+check("and 03:00 still wraps to the last window",
+      resolve_diary_group("auto", datetime(2026, 8, 28, 3, 0)), 4)
+
+os.environ["CRONO_MEAL_WINDOWS"] = "dinner:18:00,breakfast:06:00,lunch:12:00"
+check("order in the env doesn't matter",
+      [n for n, _ in meal_windows()], ["breakfast", "lunch", "dinner"])
+check("a partial set still works", resolve_diary_group("auto", datetime(2026, 8, 28, 13, 0)), 2)
+
+# A typo in an env var must not stop you logging your dinner.
+for bad in ["nonsense", "brunch:09:00", "breakfast:99:00", "breakfast:07:00,breakfast:09:00",
+            "breakfast", ""]:
+    os.environ["CRONO_MEAL_WINDOWS"] = bad
+    check(f"malformed {bad!r} falls back to defaults", meal_windows(), DEFAULT_MEAL_WINDOWS)
+del os.environ["CRONO_MEAL_WINDOWS"]
+check("unset again -> defaults", meal_windows(), DEFAULT_MEAL_WINDOWS)
+
+# ── the clock/food split ────────────────────────────────────────────
+# Three layers: an explicit meal wins outright; otherwise the clock alone
+# picks breakfast/lunch/dinner; and vision may only demote something to
+# snacks. It has no vocabulary for a time slot, which is what makes the
+# old "steak at 12:27am -> lunch" bug structurally impossible now.
+print("\nmeal from clock + food")
+import pipeline as _pl  # noqa: E402
+
+
+class _Analysis:
+    def __init__(self, course):
+        self.course = course
+
+    @property
+    def is_snack(self):
+        return self.course == "snack"
+
+
+def meal_at(h, course, explicit=None):
+    """What group a photo taken at h:00 lands in, given vision's verdict."""
+    import cronometer_client as cc
+    real = cc.datetime
+
+    class _Frozen(real):
+        @classmethod
+        def now(cls, tz=None):
+            return real(2026, 8, 28, h, 0)
+
+    cc.datetime = _Frozen
+    try:
+        return group_name(_pl._resolve_meal(explicit, _Analysis(course)))
+    finally:
+        cc.datetime = real
+
+
+check("bowl of strawberries at noon -> snacks, not lunch",
+      meal_at(12, "snack"), "snacks")
+check("a proper plate at noon -> lunch", meal_at(12, "meal"), "lunch")
+check("no opinion at noon -> lunch", meal_at(12, "unknown"), "lunch")
+check("snack at 08:00 -> snacks, not breakfast", meal_at(8, "snack"), "snacks")
+check("snack at 19:00 -> snacks, not dinner", meal_at(19, "snack"), "snacks")
+
+# The bug that caused the original revert, from both directions.
+check("steak at 00:27 -> snacks (never 'lunch' again)", meal_at(0, "meal"), "snacks")
+check("vision cannot promote a 3am meal into dinner", meal_at(3, "meal"), "snacks")
+check("a snack already in the snack window stays put", meal_at(22, "snack"), "snacks")
+
+# Explicit always wins, including over the snack demotion.
+check("explicit lunch beats the clock", meal_at(22, "meal", explicit="lunch"), "lunch")
+check("explicit lunch beats a snack verdict", meal_at(12, "snack", explicit="lunch"), "lunch")
+check("explicit uncategorized is honoured",
+      meal_at(12, "snack", explicit="uncategorized"), "uncategorized")
+check("no analysis at all falls back to the clock",
+      group_name(_pl._resolve_meal(None, None)) in DIARY_GROUPS, True)
 
 # ── matching ────────────────────────────────────────────────────────
 print("\ntoken f1")
@@ -127,12 +226,13 @@ parsed = vision._parse_response({"candidates": [{"content": {"parts": [{"text": 
         {"label": "", "query": "", "grams": 20, "confidence": 0.4, "branded": False},
         {"label": "no grams", "query": "bread", "confidence": 0.4, "branded": False},
     ],
-    "meal": "dinner", "notes": "plate looks large",
+    "course": "meal", "notes": "plate looks large",
 })}]}}]})
 check("rows without a usable amount or name are dropped", len(parsed.items), 2)
 check("query falls back to label", parsed.items[1].query, "Side salad")
 check("grams parsed", parsed.items[0].grams, 180.0)
-check("meal parsed", parsed.meal, "dinner")
+check("course parsed", parsed.course, "meal")
+check("is_snack is false for a meal", parsed.is_snack, False)
 check("box_2d parsed when present", parsed.items[0].box_2d, (120, 300, 640, 810))
 check("box_2d absent when not returned", parsed.items[1].box_2d, None)
 
@@ -254,7 +354,7 @@ print("\nvision model fallback")
 GOOD_REPLY = json.dumps({
     "items": [{"label": "Toast", "query": "toast", "grams": 30,
                "confidence": 0.9, "branded": False, "notes": ""}],
-    "meal": "breakfast", "notes": "",
+    "course": "snack", "notes": "",
 })
 calls_seen = []
 

@@ -215,6 +215,45 @@ inside a function Vercel kills at 60s is how a slow Gemini used to end as a
 504 *after* the writes had landed, which looked from the phone like nothing
 happened and from Cronometer like everything did.
 
+## Which meal it lands in
+
+Three layers, in strict order of authority:
+
+1. **An explicit `meal`** wins outright. Nothing overrides it.
+2. **The clock** alone picks breakfast / lunch / dinner.
+3. **The food** may only answer one question — *is this a snack?* — and if so
+   it moves to snacks, wherever the clock had put it.
+
+Defaults, overridable with `CRONO_MEAL_WINDOWS`:
+
+| | |
+|---|---|
+| 04:00 – 10:29 | breakfast |
+| 10:30 – 14:59 | lunch |
+| 15:00 – 20:59 | dinner |
+| 21:00 – 03:59 | snacks |
+
+The day starts at 04:00, not midnight, so a 1am plate is the tail of last
+night rather than tomorrow's breakfast.
+
+Layer 3 is deliberately one-directional, and that's the whole design. Letting
+the model pick the slot outright was tried and reverted: a steak photographed
+at 12:27am came back as *lunch*, because the plate read as a lunch-type meal.
+It has no vocabulary for a time slot now — the schema offers it `meal`,
+`snack`, `unknown` and nothing else — so the only move it can make is pulling
+a bowl of strawberries at noon out of lunch and into snacks, which is the case
+the clock genuinely gets wrong. It can't promote in the other direction
+either: a steak at 3am stays in snacks rather than becoming "dinner", because
+at that hour the slot is the honest answer.
+
+A model that answers with an old-style `"lunch"` anyway is parsed as
+`unknown` and ignored, so a stale deployment degrades to clock-only rather
+than back to the bug.
+
+Meal grouping is organizational, not nutritional — Cronometer totals
+everything per day regardless. Pass `meal=uncategorized` if you'd rather it
+not guess at all.
+
 ## What gets logged, and what doesn't
 
 Nothing is written unless three things hold: Gemini was reasonably sure what
