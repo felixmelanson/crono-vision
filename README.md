@@ -70,11 +70,30 @@ vercel --prod
 ```
 
 Confirm it came up — the health check needs no auth and tells you which env
-vars actually made it:
+vars actually made it, **and which Gemini model is really live**:
 
 ```bash
 curl https://<your-app>.vercel.app/api
 ```
+
+```json
+"model": "gemini-3.5-flash-lite",
+"model_pinned_by_env": false
+```
+
+If `model_pinned_by_env` is `true`, a `GEMINI_MODEL` in your Vercel project is
+outranking the default in [vision.py](vision.py) — worth knowing, because that
+is invisible from the code and was once worth 40 seconds a photo.
+
+`memory: 1024` in [vercel.json](vercel.json) is not about memory. Vercel scales
+CPU with it, and this function is latency-bound, not memory-hungry — the larger
+size roughly halves the cold-start import cost that otherwise lands on whoever
+presses the shutter first. Billing is GB-seconds, so paying twice per second
+for half as many seconds is close to a wash. Note that `vercel.json` rejects
+unknown keys, comment fields included, so that reasoning has to live here.
+
+`maxDuration` is the ceiling the vision budget in [vision.py](vision.py) is
+sized against. If you raise one, raise the other.
 
 ## The iOS Shortcut
 
