@@ -326,6 +326,32 @@
   .toastDot.yellow { background: var(--tier-yellow); box-shadow: 0 0 8px var(--tier-yellow); }
   .toastDot.orange { background: var(--tier-orange); box-shadow: 0 0 8px var(--tier-orange); }
   .toastDot.red    { background: var(--tier-red);    box-shadow: 0 0 8px var(--tier-red); }
+  /* ── portion chips ─────────────────────────────────────────────────
+     The model reports what a food *usually* weighs, not what's in the
+     photo — measured, it returns the same grams for an apple whether it
+     fills the frame or sits in a corner of it. So the number is a starting
+     point, and this is how you move it. Multipliers rather than a keypad:
+     one tap, no keyboard over the card, usable with the hand that isn't
+     holding the plate. */
+  .portionRow {
+    display: flex; align-items: center; gap: 6px;
+    margin-top: 8px; padding-top: 8px;
+    border-top: 1px solid rgba(255,255,255,.06);
+  }
+  .portionLabel { color: var(--dim); font-size: 12px; margin-right: 2px; }
+  .portionChip {
+    flex: 1 1 0; min-width: 0; padding: 7px 0; border-radius: 9px;
+    background: rgba(255,255,255,.07); border: 1px solid rgba(255,255,255,.14);
+    color: var(--text); font: inherit; font-size: 13px; font-weight: 600;
+    font-variant-numeric: tabular-nums;
+  }
+  .portionChip:active { background: rgba(255,255,255,.2); }
+  .portionChip:disabled { opacity: .45; }
+  /* Which row the chips act on. Only rendered when there's more than one
+     item — with a single food there is nothing to choose between. */
+  .toastRow.selectable { cursor: pointer; }
+  .toastRow.selected { box-shadow: inset 2px 0 0 var(--copper-1); padding-left: 8px; }
+
   #toastBtns { display: flex; gap: 8px; flex-wrap: wrap; }
   #toastBtns button {
     padding: 8px 14px; border-radius: 10px; font: inherit; font-size: 12.5px;
@@ -1077,7 +1103,13 @@ function renderResult(data) {
 
   // Structured rows instead of one long sentence.
   const payload = logged.length
-    ? { header: 'Logged to ' + data.meal, rows: logged.slice(0, 4).map(toastRow) }
+    ? {
+        header: 'Logged to ' + data.meal,
+        rows: logged.slice(0, 4).map(toastRow),
+        // Chips need somewhere to write back to; date and meal are what
+        // the swap endpoint wants alongside the entry itself.
+        portion: true, date: data.date, meal: data.meal,
+      }
     : shortFallbackText(review, failed);
 
   pushToast(kind, payload, actions);
@@ -1092,7 +1124,9 @@ function toastRow(e) {
   const best = e.match && e.match.best;
   const conf = best && best.confidence != null ? best.confidence : e.guess.confidence;
   const pct = conf != null ? Math.round(conf * 100) : null;
-  return { name, grams: Math.round(grams), pct };
+  // `item` carries the live entry through to the portion chips, which
+  // mutate it in place as they re-log at new weights.
+  return { name, grams: Math.round(grams), pct, item: e };
 }
 
 // Dot color is a continuous function of the displayed percentage — not
@@ -1194,8 +1228,9 @@ function advanceToast() {
         { className: 'toastRowName', textContent: row.name });
       nameLine.appendChild(name);
       nameLine.appendChild(document.createTextNode(' '));
-      nameLine.appendChild(Object.assign(document.createElement('span'),
-        { className: 'toastRowGrams', textContent: row.grams + 'g' }));
+      const grams = Object.assign(document.createElement('span'),
+        { className: 'toastRowGrams', textContent: row.grams + 'g' });
+      nameLine.appendChild(grams);
 
       const certainty = document.createElement('div');
       certainty.className = 'toastCertainty';
@@ -1205,8 +1240,11 @@ function advanceToast() {
         'Certainty Score: ' + (row.pct != null ? row.pct + '%' : '—')));
 
       r.append(nameLine, certainty);
+      r._gramsEl = grams;          // updated in place when a chip is tapped
+      r._item = row.item;
       msg.appendChild(r);
     }
+    if (next.payload.portion) renderPortionRow(msg, next.payload);
   }
 
   const btns = $('toastBtns');
@@ -1219,6 +1257,101 @@ function advanceToast() {
     btns.appendChild(b);
   }
   requestAnimationFrame(() => el.classList.add('show'));
+}
+
+// ── portion chips ─────────────────────────────────────────────────────
+// Multipliers, not absolute grams: the model's number is usually the right
+// *kind* of number and the wrong size, so "that was half of this" is the
+// correction people can actually make while looking at a plate. Absolute
+// weights are guesswork too unless you own a scale.
+const PORTION_STEPS = [
+  { label: '½×', mult: 0.5 },
+  { label: '¾×', mult: 0.75 },
+  { label: '1½×', mult: 1.5 },
+  { label: '2×', mult: 2 },
+];
+
+function renderPortionRow(msg, payload) {
+  const rows = [...msg.querySelectorAll('.toastRow')].filter(r => r._item);
+  if (!rows.length) return;
+
+  // With one food there's nothing to pick between; with several, the chips
+  // need a target, so rows become selectable and the first starts selected.
+  let selected = rows[0];
+  if (rows.length > 1) {
+    rows.forEach(r => {
+      r.classList.add('selectable');
+      r.onclick = () => {
+        rows.forEach(o => o.classList.remove('selected'));
+        r.classList.add('selected');
+        selected = r;
+      };
+    });
+    selected.classList.add('selected');
+  }
+
+  const bar = document.createElement('div');
+  bar.className = 'portionRow';
+  bar.appendChild(Object.assign(document.createElement('span'),
+    { className: 'portionLabel', textContent: 'Portion' }));
+
+  const chips = PORTION_STEPS.map(step => {
+    const b = document.createElement('button');
+    b.className = 'portionChip';
+    b.textContent = step.label;
+    b.onclick = async () => {
+      chips.forEach(c => { c.disabled = true; });
+      await adjustPortion(selected, step.mult, payload);
+      chips.forEach(c => { c.disabled = false; });
+    };
+    bar.appendChild(b);
+    return b;
+  });
+  msg.appendChild(bar);
+}
+
+// Re-log the same food at a different weight. This is the existing swap
+// endpoint with the food held constant and only the grams moving — swap
+// already removes one entry and writes another in its place, which is
+// exactly a portion change, so there's no new endpoint to add or secure.
+async function adjustPortion(row, mult, payload) {
+  const item = row._item;
+  const entry = item && item.entry;
+  if (!entry || !entry.entry_id || !entry.food_id || !entry.measure_id) {
+    pushToast('bad', "That entry can't be resized — remove it and reshoot.",
+      [{ label: 'OK', action: () => {} }]);
+    return;
+  }
+
+  const from = Number(entry.grams) || 0;
+  const to = Math.max(1, Math.round(from * mult));
+  if (to === Math.round(from)) return;
+
+  try {
+    const r = await fetchWithTimeout('/api?action=swap', {
+      method: 'POST', credentials: 'same-origin',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        entry_id: entry.entry_id, date: payload.date, meal: payload.meal,
+        food_id: entry.food_id, measure_id: entry.measure_id, grams: to,
+      }),
+    }, ACTION_TIMEOUT_MS);
+    const j = await r.json().catch(() => ({}));
+    if (r.status === 401) { sessionExpired(); return; }
+    if (!r.ok || !j.ok) {
+      pushToast('bad', j.error || "Couldn't change that portion.",
+        [{ label: 'OK', action: () => {} }]);
+      return;
+    }
+    // The entry was replaced, so its id changed — keep the row pointing at
+    // the live one or the next chip tap edits something already deleted.
+    entry.entry_id = (j.entry && j.entry.entry_id) || entry.entry_id;
+    entry.grams = to;
+    if (row._gramsEl) row._gramsEl.textContent = to + 'g';
+  } catch (e) {
+    pushToast('bad', 'Network error changing that portion.',
+      [{ label: 'OK', action: () => {} }]);
+  }
 }
 
 function resolveToast() {

@@ -583,6 +583,11 @@ class CronometerClient:
                         "date": day,
                         "meal": group_name(group),
                         "food_name": e.food_name,
+                        # Same shape as a real write. Without these a caller
+                        # can't act on a skipped entry — re-logging it at a
+                        # different portion needs the food it points at.
+                        "food_id": int(food_id),
+                        "measure_id": int(measure_id),
                         "grams": e.grams,
                     }
 

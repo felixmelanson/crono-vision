@@ -242,9 +242,13 @@ def commit(
         if isinstance(result, Exception):
             failed.append({**base, "error": str(result)})
             continue
-        base["entry"] = {**result,
-                         "food_name": result.get("food_name") or entry["plan"]["food_name"]}
-        base.pop("raw", None)
+        written = {**result,
+                   "food_name": result.get("food_name") or entry["plan"]["food_name"]}
+        # Cronometer's raw reply is of no use to the caller and rode along
+        # inside every entry — the pop was aimed one level too high to ever
+        # remove it.
+        written.pop("raw", None)
+        base["entry"] = written
         logged.append(base)
     return logged, failed
 

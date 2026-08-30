@@ -544,6 +544,54 @@ status, out = commit_call({"items": found["pending"]},
                           {"authorization": "Bearer wrong"})
 check("commit respects auth too", status, 401)
 
+# ── portion adjustment ───────────────────────────────────────────────
+# The vision model reports what a food usually weighs, not what's in the
+# photo — measured, it returns the same grams for an apple whether it fills
+# the frame or sits in a corner of it. So the number is a starting point,
+# and the card's portion chips move it. They ride the swap endpoint with
+# the food held constant and only the grams changing.
+print("\nportion adjustment")
+api_log.CronometerClient = lambda *a, **kw: fresh_client()
+added.clear()
+
+status, out = commit_call({"date": "2026-08-28", "meal": "lunch",
+                           "items": found["pending"][:1]})
+logged_entry = out["logged"][0]["entry"]
+check("a logged entry carries what a resize needs",
+      all(logged_entry.get(k) for k in ("entry_id", "food_id", "measure_id")), True)
+check("and no longer ships Cronometer's raw reply to the phone",
+      "raw" in logged_entry, False)
+
+before = logged_entry["grams"]
+blob = json.dumps({"entry_id": logged_entry["entry_id"], "date": "2026-08-28",
+                   "meal": "lunch", "food_id": logged_entry["food_id"],
+                   "measure_id": logged_entry["measure_id"],
+                   "grams": before * 1.5}).encode()
+status, out = call("POST", "/api?action=swap",
+                   {"authorization": "Bearer s3cret-token",
+                    "content-length": str(len(blob)),
+                    "content-type": "application/json"}, blob)
+check("1.5x re-logs the same food", status, 200)
+check("same food, new weight",
+      (out["entry"]["food_id"], out["entry"]["grams"]),
+      (logged_entry["food_id"], round(before * 1.5, 2)))
+check("the old entry was removed, not left alongside the new one",
+      out["removed_entry_id"], logged_entry["entry_id"])
+check("a new entry id comes back for the next adjustment",
+      out["entry"]["entry_id"] is not None, True)
+
+# A duplicate-skip returns the same shape, so a skipped item is adjustable
+# too rather than silently unresizable.
+client = fresh_client()
+client.ensure_auth()
+again = client.add_entry(food_id=logged_entry["food_id"],
+                         measure_id=logged_entry["measure_id"],
+                         grams=round(before * 1.5, 2), date="2026-08-28",
+                         diary_group="lunch")
+check("a skipped duplicate still reports the food it points at",
+      (again["skipped"], again["food_id"], again["measure_id"]),
+      (True, logged_entry["food_id"], logged_entry["measure_id"]))
+
 print()
 if _failures:
     print(f"{len(_failures)} FAILED: {', '.join(_failures)}")

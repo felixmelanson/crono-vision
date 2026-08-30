@@ -60,6 +60,43 @@ python cli.py remove 123456        # undo, ids come from `today`
 `--hint` is worth using. Telling it "this is a 250g steak" beats any amount of
 prompt tuning, because portion size is the part vision is genuinely bad at.
 
+## Portions: read this before trying to fix them
+
+The model does not measure portions. It recognises the food and reports what
+that food *typically* weighs. Measured, on the same apple:
+
+| | |
+|---|---|
+| Tiny in frame vs filling it | 170g vs 182g |
+| 0.8× vs 2.0× a bank card in frame (~15× the volume) | 180g vs 180g |
+| Same, forced to write the width in mm before the grams | measured 88mm vs 510mm → **still** 180g vs 220g |
+| Same, on a thinking model (4.5-7.9s) | 182g vs 182g |
+
+The third row is the one that settles it: told to measure against a reference,
+the model *correctly perceives* the size difference, writes it down, and then
+answers with the prior anyway. A thinking model does no better and costs five
+times as long. This was attempted with prose scaffolding, with numeric
+scaffolding, and with a bigger model; none of it moved the number, so please
+don't spend an afternoon on prompt wording.
+
+What that means in practice:
+
+- **Whole standard items** — an apple, a banana, an egg — come out accurate,
+  because the prior *is* the right answer.
+- **Anything portioned** — rice, pasta, meat, cereal, anything in a bowl — comes
+  out as a generic serving regardless of how much is actually there.
+
+So the grams are a starting point, and there are two ways to move them. A
+`hint` at capture time ("the rice is about 200g") overrides the prior before
+anything is written and is the only thing that reliably does. After the fact,
+the result card carries **portion chips** — ½× ¾× 1½× 2× — which re-log the
+same food at a new weight, one tap, no keyboard. With several items on the
+card, tap a row to choose which one the chips act on.
+
+Under the hood a chip is just the swap endpoint with the food held constant
+and the grams moving, so there's no extra endpoint and no new surface to
+secure.
+
 ## Deploying
 
 ```bash
